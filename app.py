@@ -375,43 +375,109 @@ def extract_industry_size(pages):
 
     return result
 
+
 def extract_growth(pages):
-    # Specifically target revenue growth, not price growth or product-category growth.
-    relevant = find_pages(
-        pages,
-        ["Revenue", "2025-30", "2025–30", "forecast CAGR", "five-year growth rates"]
-    )
+    """
+    Extract the best forward-looking five-year-ish industry growth trajectory.
 
-    forecast_hit = None
-    historical_hit = None
+    Priority:
+    1. Golf-specific forecast CAGR ending around 2030-2032
+    2. Other explicit forecast CAGR values
+    3. IBISWorld-style 2025-2030 forecast CAGR
+    4. Historical CAGR only as supporting context
 
-    forecast_patterns = [
-        r"Revenue[^.]{0,120}(2025[-–]30|2025[-–]2030)\s*[■•:\-]?\s*([\d.]+)%",
-        r"(2025[-–]30|2025[-–]2030)\s*[■•:\-]?\s*([\d.]+)%"
-    ]
+    This avoids accidentally using price inflation or product-specific growth as the industry growth rate.
+    """
 
-    hist_patterns = [
-        r"Revenue[^.]{0,120}(2020[-–]25|2020[-–]2025)\s*[■•:\-]?\s*([\d.]+)%",
-        r"(2020[-–]25|2020[-–]2025)\s*[■•:\-]?\s*([\d.]+)%"
-    ]
+    def growth_source_priority(document):
+        d = document.lower()
+        if "gol" in d or "golf" in d or "barnes" in d or "ghto" in d:
+            return 10
+        if "marketresearch" in d or "market research" in d:
+            return 9
+        if "ibis" in d or "33992" in d:
+            return 7
+        return 2
 
-    for p in relevant:
-        for pat in forecast_patterns:
-            m = re.search(pat, p["text"], flags=re.I)
-            if m:
-                forecast_hit = (m.group(1), m.group(2), p)
-                break
-        if forecast_hit:
-            break
+    forecast_candidates = []
+    historical_candidates = []
 
-    for p in relevant:
-        for pat in hist_patterns:
-            m = re.search(pat, p["text"], flags=re.I)
-            if m:
-                historical_hit = (m.group(1), m.group(2), p)
-                break
-        if historical_hit:
-            break
+    for p in pages:
+        text = p["text"]
+        base = growth_source_priority(p["document"])
+
+        # Best case: explicit "CAGR 2027-2032 4.9%"
+        for m in re.finditer(r"CAGR\s+(20\d{2})[-–](20\d{2})\s+(-?\d+(?:\.\d+)?)%", text, flags=re.I):
+            start_year = int(m.group(1))
+            end_year = int(m.group(2))
+            pct = float(m.group(3))
+            years = end_year - start_year
+
+            score = base
+            if 4 <= years <= 6:
+                score += 12
+            if end_year >= 2030:
+                score += 8
+            if start_year >= 2026:
+                score += 6
+
+            context_start = max(0, m.start() - 250)
+            context_end = min(len(text), m.end() + 250)
+            context = clean_text(text[context_start:context_end])
+            context_low = context.lower()
+
+            if "market" in context_low:
+                score += 3
+            if "forecast" in context_low or "projection" in context_low:
+                score += 4
+
+            if any(bad in context_low for bad in [
+                "price", "prices", "payroll", "wages", "playground equipment",
+                "health insurance", "transportation cost", "operating cost"
+            ]):
+                score -= 12
+
+            forecast_candidates.append({
+                "period": f"{start_year}-{end_year}",
+                "cagr": pct,
+                "document": p["document"],
+                "page": p.get("page"),
+                "location": p["location"],
+                "score": score
+            })
+
+        # IBISWorld style: Revenue ... 2025-30 ... 0.6%
+        for m in re.finditer(
+            r"Revenue[^.]{0,180}(2025[-–]30|2025[-–]2030)\s*[■•:\-]?\s*(-?\d+(?:\.\d+)?)%",
+            text,
+            flags=re.I
+        ):
+            forecast_candidates.append({
+                "period": m.group(1).replace("–", "-"),
+                "cagr": float(m.group(2)),
+                "document": p["document"],
+                "page": p.get("page"),
+                "location": p["location"],
+                "score": base + 10
+            })
+
+        # Historical revenue CAGR
+        for m in re.finditer(
+            r"Revenue[^.]{0,180}(2020[-–]25|2020[-–]2025)\s*[■•:\-]?\s*(-?\d+(?:\.\d+)?)%",
+            text,
+            flags=re.I
+        ):
+            historical_candidates.append({
+                "period": m.group(1).replace("–", "-"),
+                "cagr": float(m.group(2)),
+                "document": p["document"],
+                "page": p.get("page"),
+                "location": p["location"],
+                "score": base + 8
+            })
+
+    forecast_candidates.sort(key=lambda x: x["score"], reverse=True)
+    historical_candidates.sort(key=lambda x: x["score"], reverse=True)
 
     result = {
         "forecast_period": "Not found",
@@ -423,39 +489,36 @@ def extract_growth(pages):
         "source": "Not found"
     }
 
-    if forecast_hit:
-        period, pct, p = forecast_hit
-        result["forecast_period"] = period
-        result["forecast_cagr"] = pct + "%"
-        value = safe_float(pct)
+    if forecast_candidates:
+        best = forecast_candidates[0]
+        result["forecast_period"] = best["period"]
+        result["forecast_cagr"] = f'{best["cagr"]:.1f}%'
+        result["source"] = f'{best["document"]}, {best["location"]}'
 
-        if value is not None:
-            if value > 2:
-                direction = "Growing"
-                interp = "The industry is expected to grow at a moderate-to-strong pace."
-            elif value > 0:
-                direction = "Slow growth"
-                interp = "The industry is expected to remain positive but grow slowly."
-            elif value == 0:
-                direction = "Flat"
-                interp = "The industry is expected to remain relatively flat."
-            else:
-                direction = "Declining"
-                interp = "The industry is expected to contract over the forecast period."
+        pct = best["cagr"]
+        if pct > 5:
+            result["direction"] = "Strong growth"
+            result["interpretation"] = "The market is projected to grow at a strong pace over the forecast period."
+        elif pct > 2:
+            result["direction"] = "Moderate growth"
+            result["interpretation"] = "The market is projected to grow at a moderate and sustained pace over the forecast period."
+        elif pct > 0:
+            result["direction"] = "Slow growth"
+            result["interpretation"] = "The market is projected to remain positive but grow slowly over the forecast period."
+        elif pct == 0:
+            result["direction"] = "Flat"
+            result["interpretation"] = "The market is projected to remain relatively flat over the forecast period."
+        else:
+            result["direction"] = "Declining"
+            result["interpretation"] = "The market is projected to contract over the forecast period."
 
-            result["direction"] = direction
-            result["interpretation"] = interp
-
-        result["source"] = f'{p["document"]}, {p["location"]}'
-
-    if historical_hit:
-        period, pct, p = historical_hit
-        result["historical_period"] = period
-        result["historical_cagr"] = pct + "%"
-        if result["source"] == "Not found":
-            result["source"] = f'{p["document"]}, {p["location"]}'
+    if historical_candidates:
+        best_hist = historical_candidates[0]
+        result["historical_period"] = best_hist["period"]
+        result["historical_cagr"] = f'{best_hist["cagr"]:.1f}%'
 
     return result
+
 
 def extract_competitors(pages):
     # Look specifically for major player tables / market-share text.
