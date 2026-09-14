@@ -4,6 +4,8 @@ import re, os, tempfile
 from io import BytesIO
 import pandas as pd
 import requests
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 from pypdf import PdfReader
 from ddgs import DDGS
 from reportlab.lib.pagesizes import letter
@@ -191,24 +193,158 @@ def verify_naics(code, census_pages):
         options.append({"code":code, "page":row["page"], "text":window, "score":score})
     return max(options, key=lambda x:x["score"]) if options else None
 
+
+def extract_census_industry_entries(census_pages):
+    """
+    Build searchable six-digit NAICS industry entries from the official Census manual.
+    This is used as a fallback when public web search does not expose a usable NAICS code.
+    """
+    entries = []
+    seen = set()
+
+    for row in census_pages:
+        text = row["text"]
+
+        # Match six-digit NAICS code followed by title/description text.
+        # We keep windows only when they look like an actual industry definition.
+        for match in re.finditer(r'(?<!\d)(\d{6})(?!\d)', text):
+            code = match.group(1)
+            start = match.start()
+            end = min(len(text), start + 1800)
+            window = clean(text[start:end])
+            low = window.lower()
+
+            if code in seen:
+                continue
+
+            # Prefer true industry-definition sections over alphabetic-index references.
+            if "this industry comprises establishments primarily engaged" not in low:
+                continue
+
+            # Capture a compact title from the text immediately after the code.
+            after = clean(window[len(code):])
+            title_match = re.match(r'[\s\-–—:]*([A-Z][A-Za-z0-9,&/() \-]{3,100})', after)
+            title = title_match.group(1).strip(" -–—:") if title_match else ""
+
+            # Stop description at obvious next-section markers when possible.
+            desc = window
+            for marker in ["Cross-References.", "Cross References.", "Illustrative Examples:", "The establishments in this industry"]:
+                idx = desc.find(marker)
+                if idx > 0:
+                    desc = desc[:idx]
+                    break
+
+            entries.append({
+                "code": code,
+                "title": title,
+                "page": row["page"],
+                "text": desc
+            })
+            seen.add(code)
+
+    return entries
+
+
+def rank_naics_by_census_profile(profile, census_pages, limit=6):
+    """
+    Generic fallback: compare the detected company business profile against
+    official Census six-digit industry descriptions using TF-IDF similarity.
+    """
+    entries = extract_census_industry_entries(census_pages)
+    if not entries or not profile.strip():
+        return []
+
+    corpus = [profile] + [
+        f'{e["title"]} {e["text"]}'
+        for e in entries
+    ]
+
+    vectorizer = TfidfVectorizer(
+        stop_words="english",
+        ngram_range=(1, 2),
+        max_features=50000
+    )
+    matrix = vectorizer.fit_transform(corpus)
+    sims = cosine_similarity(matrix[0:1], matrix[1:])[0]
+
+    ranked = []
+    profile_low = profile.lower()
+
+    for idx, entry in enumerate(entries):
+        score = float(sims[idx])
+        text_low = (entry["title"] + " " + entry["text"]).lower()
+
+        # Small generic boosts for exact business nouns appearing in both.
+        profile_terms = set(re.findall(r"[a-z]{4,}", profile_low))
+        census_terms = set(re.findall(r"[a-z]{4,}", text_low))
+        overlap = profile_terms & census_terms
+        score += min(len(overlap), 20) * 0.003
+
+        # Helpful specificity boosts for common operating words.
+        for phrase in [
+            "manufacturing", "retail", "wholesale", "software", "insurance",
+            "construction", "restaurant", "hospital", "bank", "golf",
+            "sporting", "apparel", "footwear"
+        ]:
+            if phrase in profile_low and phrase in text_low:
+                score += 0.03
+
+        ranked.append({
+            "code": entry["code"],
+            "page": entry["page"],
+            "text": entry["text"],
+            "rank_score": score
+        })
+
+    ranked.sort(key=lambda x: x["rank_score"], reverse=True)
+    return ranked[:limit]
+
+
 def rank_naics(company):
+    """
+    Find the best NAICS code automatically.
+
+    First:
+      - search the public web for company-specific NAICS candidates
+      - verify every candidate against the official Census manual
+
+    Fallback:
+      - if web search does not return a useful candidate, compare the company's
+        detected business profile directly against official Census six-digit
+        industry descriptions and rank the closest matches.
+    """
     profile = discover_company_profile(company)
-    codes = candidate_naics_codes(company)
     census = load_census_manual()
+
+    # -------- Existing web-discovery method --------
+    codes = candidate_naics_codes(company)
     pwords = set(re.findall(r"[a-z]{3,}", profile.lower()))
     ranked = []
+
     for code in codes:
         item = verify_naics(code, census)
         if not item:
             continue
+
         cwords = set(re.findall(r"[a-z]{3,}", item["text"].lower()))
         score = item["score"] + len(pwords & cwords)
-        for phrase in ["golf","sporting","athletic","golf ball","golf club","apparel","footwear"]:
+
+        for phrase in [
+            "golf", "sporting", "athletic", "apparel", "footwear",
+            "retail", "wholesale", "manufacturing"
+        ]:
             if phrase in profile.lower() and phrase in item["text"].lower():
-                score += 8
+                score += 7
+
         item["rank_score"] = score
         ranked.append(item)
-    ranked.sort(key=lambda x:x["rank_score"], reverse=True)
+
+    ranked.sort(key=lambda x: x["rank_score"], reverse=True)
+
+    # -------- Fallback directly against Census descriptions --------
+    if not ranked:
+        ranked = rank_naics_by_census_profile(profile, census, limit=6)
+
     return profile, ranked[:6]
 
 # ============================================================
