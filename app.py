@@ -4,8 +4,6 @@ import re, os, tempfile
 from io import BytesIO
 import pandas as pd
 import requests
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 from pypdf import PdfReader
 from ddgs import DDGS
 from reportlab.lib.pagesizes import letter
@@ -113,7 +111,7 @@ def sentence_candidates(pages, keywords, reject=None, max_items=3):
     return out
 
 # ============================================================
-# AUTOMATIC NAICS — SAME APPROACH AS BEFORE
+# AUTOMATIC NAICS
 # ============================================================
 
 def web_search(query, max_results=6):
@@ -122,82 +120,76 @@ def web_search(query, max_results=6):
         with DDGS() as ddgs:
             for r in ddgs.text(query, max_results=max_results):
                 rows.append({
-                    "title": clean(r.get("title","")),
-                    "url": r.get("href",""),
-                    "snippet": clean(r.get("body",""))
+                    "title": clean(r.get("title", "")),
+                    "url": r.get("href", ""),
+                    "snippet": clean(r.get("body", ""))
                 })
     except Exception:
         pass
     return rows
 
-@st.cache_resource(show_spinner=False)
-def load_census_manual():
-    r = requests.get(CENSUS_MANUAL_URL, timeout=60)
-    r.raise_for_status()
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-        tmp.write(r.content)
-        path = tmp.name
-    reader = PdfReader(path)
-    pages = [{"page": i, "text": clean(p.extract_text() or "")}
-             for i,p in enumerate(reader.pages, start=1)]
-    try:
-        os.remove(path)
-    except:
-        pass
-    return pages
 
 def discover_company_profile(company):
-    snippets = []
+    """
+    Build a short description of what the company actually does.
+    This step is independent of the uploaded reports.
+    """
+    results = []
     for q in [
-        f'"{company}" products company overview',
-        f'"{company}" annual report products',
-        f'"{company}" manufactures sells'
+        f'"{company}" company overview products',
+        f'"{company}" annual report business products',
+        f'"{company}" manufactures sells',
+        f'"{company}" primary business'
     ]:
-        for r in web_search(q, 5):
-            if r["snippet"]:
-                snippets.append(r["snippet"])
+        results.extend(web_search(q, max_results=5))
+
+    snippets = []
+    seen = set()
+
+    for r in results:
+        s = clean(r.get("snippet", ""))
+        if s and s.lower() not in seen:
+            seen.add(s.lower())
+            snippets.append(s)
+
     return " ".join(snippets[:8])
 
-def candidate_naics_codes(company):
-    counts = {}
-    for q in [
-        f'"{company}" NAICS code',
-        f'"{company}" "NAICS"',
-        f'"{company}" industry classification NAICS'
-    ]:
-        for r in web_search(q, 8):
-            for c in re.findall(r'(?<!\d)(\d{6})(?!\d)', r["title"]+" "+r["snippet"]):
-                counts[c] = counts.get(c,0)+1
-    return [c for c,_ in sorted(counts.items(), key=lambda x:x[1], reverse=True)[:12]]
 
-def verify_naics(code, census_pages):
-    patt = re.compile(rf'(?<!\d){re.escape(code)}(?!\d)')
-    options = []
-    for row in census_pages:
-        m = patt.search(row["text"])
-        if not m:
-            continue
-        start = max(0, m.start()-120)
-        end = min(len(row["text"]), m.end()+1050)
-        window = clean(row["text"][start:end])
-        low = window.lower()
-        score = 0
-        if "this industry comprises establishments primarily engaged" in low:
-            score += 15
-        if "see industry description for" in low:
-            score += 3
-        if "cross-references" in low:
-            score += 2
-        if row["page"] < 650:
-            score += 3
-        options.append({"code":code, "page":row["page"], "text":window, "score":score})
-    return max(options, key=lambda x:x["score"]) if options else None
-
-
-def extract_census_industry_entries(census_pages):
+@st.cache_resource(show_spinner=False)
+def load_census_manual():
     """
-    Build searchable six-digit NAICS industry entries from the official Census manual.
-    This is used as a fallback when public web search does not expose a usable NAICS code.
+    Download and parse the official 2022 U.S. Census NAICS Manual once.
+    """
+    response = requests.get(
+        CENSUS_MANUAL_URL,
+        timeout=60,
+        headers={"User-Agent": "Mozilla/5.0"}
+    )
+    response.raise_for_status()
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        tmp.write(response.content)
+        path = tmp.name
+
+    reader = PdfReader(path)
+    pages = []
+    for i, page in enumerate(reader.pages, start=1):
+        pages.append({
+            "page": i,
+            "text": clean(page.extract_text() or "")
+        })
+
+    try:
+        os.remove(path)
+    except Exception:
+        pass
+
+    return pages
+
+
+def extract_official_naics_entries(census_pages):
+    """
+    Pull six-digit NAICS industry definitions from the official Census manual.
     """
     entries = []
     seen = set()
@@ -205,146 +197,105 @@ def extract_census_industry_entries(census_pages):
     for row in census_pages:
         text = row["text"]
 
-        # Match six-digit NAICS code followed by title/description text.
-        # We keep windows only when they look like an actual industry definition.
-        for match in re.finditer(r'(?<!\d)(\d{6})(?!\d)', text):
-            code = match.group(1)
-            start = match.start()
-            end = min(len(text), start + 1800)
-            window = clean(text[start:end])
-            low = window.lower()
+        for m in re.finditer(r'(?<!\d)(\d{6})(?!\d)', text):
+            code = m.group(1)
 
             if code in seen:
                 continue
 
-            # Prefer true industry-definition sections over alphabetic-index references.
+            start = m.start()
+            end = min(len(text), start + 1800)
+            window = clean(text[start:end])
+            low = window.lower()
+
             if "this industry comprises establishments primarily engaged" not in low:
                 continue
 
-            # Capture a compact title from the text immediately after the code.
-            after = clean(window[len(code):])
-            title_match = re.match(r'[\s\-–—:]*([A-Z][A-Za-z0-9,&/() \-]{3,100})', after)
-            title = title_match.group(1).strip(" -–—:") if title_match else ""
+            # Capture the title between the code and the formal Census definition.
+            after_code = window[len(code):]
+            idx = after_code.lower().find("this industry comprises establishments primarily engaged")
+            title = clean(after_code[:idx]) if idx > 0 else ""
+            title = re.sub(r"^[\s\-–—:]+", "", title)
+            title = re.sub(r"\s+", " ", title)
+            title = title[:160].strip(" -–—:")
 
-            # Stop description at obvious next-section markers when possible.
-            desc = window
-            for marker in ["Cross-References.", "Cross References.", "Illustrative Examples:", "The establishments in this industry"]:
-                idx = desc.find(marker)
-                if idx > 0:
-                    desc = desc[:idx]
-                    break
+            # Keep the official definition concise.
+            def_match = re.search(
+                r"(This industry comprises establishments primarily engaged in .*?)(?= Cross-References| Cross References|$)",
+                window,
+                flags=re.I
+            )
+            definition = clean(def_match.group(1)) if def_match else window
 
             entries.append({
                 "code": code,
                 "title": title,
                 "page": row["page"],
-                "text": desc
+                "text": f"{code} — {title}. {definition}"
             })
             seen.add(code)
 
     return entries
 
 
-def rank_naics_by_census_profile(profile, census_pages, limit=6):
+def profile_similarity(profile, entry_text):
     """
-    Generic fallback: compare the detected company business profile against
-    official Census six-digit industry descriptions using TF-IDF similarity.
+    Lightweight generic similarity score between company activity and Census industry text.
     """
-    entries = extract_census_industry_entries(census_pages)
-    if not entries or not profile.strip():
-        return []
+    stop = {
+        "company","companies","business","products","product","market","industry",
+        "sales","sells","selling","offers","provides","including","their","this",
+        "that","with","from","into","have","has","and","the","for","are","was","were"
+    }
 
-    corpus = [profile] + [
-        f'{e["title"]} {e["text"]}'
-        for e in entries
-    ]
-
-    vectorizer = TfidfVectorizer(
-        stop_words="english",
-        ngram_range=(1, 2),
-        max_features=50000
+    p_terms = set(
+        w for w in re.findall(r"[a-z]{3,}", profile.lower())
+        if w not in stop
     )
-    matrix = vectorizer.fit_transform(corpus)
-    sims = cosine_similarity(matrix[0:1], matrix[1:])[0]
+    e_terms = set(re.findall(r"[a-z]{3,}", entry_text.lower()))
 
-    ranked = []
-    profile_low = profile.lower()
+    overlap = p_terms & e_terms
+    score = len(overlap)
 
-    for idx, entry in enumerate(entries):
-        score = float(sims[idx])
-        text_low = (entry["title"] + " " + entry["text"]).lower()
+    # Strong boosts for specific business/activity words when both contain them.
+    for phrase in [
+        "golf", "sporting", "athletic", "golf balls", "golf clubs",
+        "manufacturing", "retail", "wholesale", "apparel", "footwear",
+        "software", "insurance", "restaurant", "construction", "hospital",
+        "bank", "equipment"
+    ]:
+        if phrase in profile.lower() and phrase in entry_text.lower():
+            score += 8
 
-        # Small generic boosts for exact business nouns appearing in both.
-        profile_terms = set(re.findall(r"[a-z]{4,}", profile_low))
-        census_terms = set(re.findall(r"[a-z]{4,}", text_low))
-        overlap = profile_terms & census_terms
-        score += min(len(overlap), 20) * 0.003
-
-        # Helpful specificity boosts for common operating words.
-        for phrase in [
-            "manufacturing", "retail", "wholesale", "software", "insurance",
-            "construction", "restaurant", "hospital", "bank", "golf",
-            "sporting", "apparel", "footwear"
-        ]:
-            if phrase in profile_low and phrase in text_low:
-                score += 0.03
-
-        ranked.append({
-            "code": entry["code"],
-            "page": entry["page"],
-            "text": entry["text"],
-            "rank_score": score
-        })
-
-    ranked.sort(key=lambda x: x["rank_score"], reverse=True)
-    return ranked[:limit]
+    return score
 
 
 def rank_naics(company):
     """
-    Find the best NAICS code automatically.
+    Earlier-style NAICS workflow:
+    Company name -> public company/business description -> official Census NAICS manual -> best-fit six-digit code.
 
-    First:
-      - search the public web for company-specific NAICS candidates
-      - verify every candidate against the official Census manual
-
-    Fallback:
-      - if web search does not return a useful candidate, compare the company's
-        detected business profile directly against official Census six-digit
-        industry descriptions and rank the closest matches.
+    Uploaded reports are NOT used to determine the NAICS code.
     """
     profile = discover_company_profile(company)
-    census = load_census_manual()
 
-    # -------- Existing web-discovery method --------
-    codes = candidate_naics_codes(company)
-    pwords = set(re.findall(r"[a-z]{3,}", profile.lower()))
+    if not profile.strip():
+        return profile, []
+
+    census_pages = load_census_manual()
+    entries = extract_official_naics_entries(census_pages)
+
     ranked = []
-
-    for code in codes:
-        item = verify_naics(code, census)
-        if not item:
+    for entry in entries:
+        score = profile_similarity(profile, entry["text"])
+        if score <= 0:
             continue
 
-        cwords = set(re.findall(r"[a-z]{3,}", item["text"].lower()))
-        score = item["score"] + len(pwords & cwords)
-
-        for phrase in [
-            "golf", "sporting", "athletic", "apparel", "footwear",
-            "retail", "wholesale", "manufacturing"
-        ]:
-            if phrase in profile.lower() and phrase in item["text"].lower():
-                score += 7
-
+        item = dict(entry)
         item["rank_score"] = score
         ranked.append(item)
 
     ranked.sort(key=lambda x: x["rank_score"], reverse=True)
-
-    # -------- Fallback directly against Census descriptions --------
-    if not ranked:
-        ranked = rank_naics_by_census_profile(profile, census, limit=6)
-
     return profile, ranked[:6]
 
 # ============================================================
@@ -927,7 +878,7 @@ if "brief" in st.session_state:
     alt=None
     st.subheader("NAICS Classification")
     if ranked:
-        labels=[f'{x["code"]} — Census p. {x["page"]}' for x in ranked]
+        labels=[f'{x["code"]} — {x.get("title","U.S. Census")}' for x in ranked]
         selected=st.selectbox("Selected NAICS",labels,index=0)
         chosen=ranked[labels.index(selected)]
         st.markdown(f'**Selected code:** {chosen["code"]}')
@@ -936,12 +887,13 @@ if "brief" in st.session_state:
 
         alternatives=[x for x in ranked if x["code"]!=chosen["code"]]
         if alternatives:
-            alt_labels=[""]+[f'{x["code"]} — Census p. {x["page"]}' for x in alternatives]
+            alt_labels=[""]+[f'{x["code"]} — {x.get("title","U.S. Census")}' for x in alternatives]
             a=st.selectbox("Neighboring / alternative code",alt_labels)
             if a:
                 code=a.split(" — ")[0]
                 alt=next(x for x in alternatives if x["code"]==code)
                 st.write(alt["text"])
+                st.markdown(f'**Source:** [2022 U.S. Census NAICS Manual]({CENSUS_MANUAL_URL}), PDF p. {alt["page"]}')
     else:
         st.warning("No Census-verified NAICS candidate was returned.")
     st.info("**Section Summary:** " + b["summaries"]["naics"])
