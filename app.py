@@ -640,16 +640,33 @@ def markdown_pdf(md):
 # UI
 # ============================================================
 
-st.title("Company Name")
+st.title("📊 Industry Intelligence Pipeline")
+st.caption("Turn a company name and uploaded industry reports into a structured, source-traceable industry brief.")
+
+col1, col2, col3 = st.columns(3)
+with col1:
+    st.markdown("### 🧭 NAICS")
+    st.caption("Automatically finds and verifies the best-fit NAICS code using the U.S. Census manual.")
+with col2:
+    st.markdown("### 📚 Evidence")
+    st.caption("Searches your uploaded reports for the strongest evidence for every required assignment signal.")
+with col3:
+    st.markdown("### 📝 Brief")
+    st.caption("Returns sourced findings plus a short summary at the end of every section.")
+
+st.divider()
+
+st.subheader("Company Name")
 company = st.text_input("Company name", placeholder="Example: Callaway Golf Company", label_visibility="collapsed")
 
-st.title("Upload Reports")
+st.subheader("Upload Reports")
 uploads = st.file_uploader(
     "Upload industry reports",
     type=["pdf"],
     accept_multiple_files=True,
     label_visibility="collapsed"
 )
+st.caption("Upload any relevant industry reports. The tool looks for similar information even when the report titles and formats differ.")
 
 run = st.button("Build Industry Brief", type="primary", use_container_width=True, disabled=(not company or not uploads))
 
