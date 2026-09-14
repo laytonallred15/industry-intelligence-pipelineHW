@@ -468,30 +468,206 @@ def extract_threat(ibis_name, ibis_pages, barnes_name, barnes_pages):
     )
     return {"threat":title, "interpretation":interpretation, "evidence":evidence[:4]}
 
-def build_brief(company, reports):
-    ibis = reports.get("ibis")
-    barnes = reports.get("barnes")
-    kentley = reports.get("kentley")
 
-    if not ibis or not barnes or not kentley:
+def build_brief(company, report_data):
+    """
+    Build the assignment brief from ANY uploaded report set.
+
+    Rather than requiring specific filenames, the tool scores the uploaded reports
+    for the type of evidence needed by each section. The same report may be used
+    for more than one section when it contains the strongest evidence.
+    """
+    if not report_data:
         return None
 
-    ibis_name, ibis_pages = ibis
-    barnes_name, barnes_pages = barnes
-    kentley_name, kentley_pages = kentley
+    # Select the best available report for each evidence role.
+    industry_report = select_report(
+        report_data,
+        [
+            "industry revenue", "revenue", "major players", "company market share",
+            "regulation", "buyer power", "supplier power", "imports",
+            "supply chain", "industry structure"
+        ]
+    ) or report_data[0]
+
+    outlook_report = select_report(
+        report_data,
+        [
+            "cagr", "forecast", "projection", "market drivers", "market restraints",
+            "market end users", "outlook", "technology", "participation"
+        ]
+    ) or industry_report
+
+    retail_report = select_report(
+        report_data,
+        [
+            "global market size", "retail sales", "worldwide sales",
+            "annual growth", "2029", "regional share"
+        ]
+    ) or outlook_report
+
+    industry_name, industry_pages = industry_report
+    outlook_name, outlook_pages = outlook_report
+    retail_name, retail_pages = retail_report
+
+    size = extract_ibis_size_growth(industry_name, industry_pages)
+    golf_growth = extract_barnes_growth(outlook_name, outlook_pages)
+    retail_context = extract_kentley_context(retail_name, retail_pages)
+
+    # Fallback: if the "outlook" report did not contain the expected explicit CAGR,
+    # try every uploaded report and keep the first successful result.
+    if golf_growth.get("five_year_cagr") == "Not found":
+        for name, pages in report_data:
+            candidate = extract_barnes_growth(name, pages)
+            if candidate.get("five_year_cagr") != "Not found":
+                golf_growth = candidate
+                break
+
+    # Same fallback idea for current industry size.
+    if size.get("industry_size") == "Not found":
+        for name, pages in report_data:
+            candidate = extract_ibis_size_growth(name, pages)
+            if candidate.get("industry_size") != "Not found":
+                size = candidate
+                break
+
+    competitors = extract_competitors(industry_name, industry_pages, company)
+    if len(competitors) < 3:
+        # Merge competitor evidence from all reports, while preserving target company.
+        merged = []
+        seen = set()
+        for name, pages in report_data:
+            for row in extract_competitors(name, pages, company):
+                key = row["company"].lower()
+                if key not in seen:
+                    seen.add(key)
+                    merged.append(row)
+
+        def share_rank(x):
+            nums = [float(n) for n in re.findall(r"\d+(?:\.\d+)?", x["market_share"])]
+            return max(nums) if nums else 0
+
+        target_words = [w for w in re.findall(r"[a-z0-9]+", company.lower()) if len(w) > 3]
+        target = [x for x in merged if any(w in x["company"].lower() for w in target_words)]
+        others = [x for x in merged if x not in target]
+        target.sort(key=share_rank, reverse=True)
+        others.sort(key=share_rank, reverse=True)
+        competitors = (target[:1] + others)[:5]
+
+    regulation = extract_regulation(industry_name, industry_pages)
+    supply_chain = extract_supply_chain(industry_name, industry_pages)
+    customers = extract_customer(industry_name, industry_pages)
+    end_users = extract_barnes_end_users(outlook_name, outlook_pages)
+    trend = extract_trend(industry_name, industry_pages, outlook_name, outlook_pages)
+    threat = extract_threat(industry_name, industry_pages, outlook_name, outlook_pages)
+
+    # Paragraph summaries for every required section.
+    size_summary = (
+        f"The strongest current industry-size evidence found was {size['industry_size']} "
+        f"for {size['industry_size_year']}. The pipeline selected this figure from the report "
+        "that most directly described industry revenue or market size."
+        if size["industry_size"] != "Not found"
+        else
+        "The uploaded reports did not contain a clearly identifiable current industry-size figure. "
+        "A report with an explicit industry revenue or market-size table would improve this section."
+    )
+
+    growth_parts = []
+    if size.get("forecast_cagr") != "Not found":
+        growth_parts.append(
+            f"the broader industry is forecast at {size['forecast_cagr']} CAGR "
+            f"for {size['forecast_period']}"
+        )
+    if golf_growth.get("five_year_cagr") != "Not found":
+        growth_parts.append(
+            f"the strongest five-year market forecast is {golf_growth['five_year_cagr']} CAGR "
+            f"for {golf_growth['period']}"
+        )
+    growth_summary = (
+        "The reports indicate " + " while ".join(growth_parts) + ". "
+        "Together, these figures show the expected direction and pace of industry growth."
+        if growth_parts else
+        "The uploaded reports did not provide a clean five-year CAGR or equivalent market-growth forecast."
+    )
+
+    if competitors:
+        comp_text = ", ".join(
+            f"{x['company']} ({x['market_share']})" for x in competitors
+        )
+        competitors_summary = (
+            f"The strongest named market-share evidence identifies {comp_text}. "
+            "The tool preserves ranges exactly as reported rather than inventing point estimates. "
+            "The focal company is included whenever its share appears in the uploaded reports."
+        )
+    else:
+        competitors_summary = (
+            "The uploaded reports did not provide reliable named company market-share estimates. "
+            "A competitive-landscape or company-market-share table would be needed."
+        )
+
+    regulation_summary = (
+        "The reports show that the main compliance pressures involve product-safety, environmental, "
+        "labor, or other manufacturing regulations. These requirements can increase compliance costs "
+        "and create recall, legal, or operating risk."
+        if regulation else
+        "The uploaded reports did not contain enough direct regulatory evidence to support a clear conclusion."
+    )
+
+    supply_summary = (
+        "The supply-chain evidence points to exposure to imports, tariffs, offshoring, suppliers, or raw-material volatility. "
+        "These factors can increase costs and make the industry more vulnerable to trade-policy or overseas-production disruptions."
+        if supply_chain else
+        "The uploaded reports did not contain enough direct supply-chain evidence to assess concentration or fragility."
+    )
+
+    customers_summary = (
+        f"The customer structure is best characterized as {customers['assessment'].lower()}. "
+        f"Buyer power is reported as {customers['buyer_power'].lower()}. "
+        "The supporting evidence suggests demand is spread across multiple customer or end-user groups rather than one dominant buyer."
+        if customers["assessment"] != "Not found"
+        else
+        "The uploaded reports did not provide enough direct evidence to classify customer concentration."
+    )
+
+    trend_summary = (
+        f"The clearest five-year trend is {trend['trend'].lower()}. "
+        f"{trend['interpretation']}"
+        if trend.get("trend") and trend["trend"] != "Not found"
+        else
+        "The uploaded reports did not provide enough forward-looking evidence to identify a defensible biggest trend."
+    )
+
+    threat_summary = (
+        f"The biggest threat identified is {threat['threat'].lower()}. "
+        f"{threat['interpretation']}"
+        if threat.get("threat") and threat["threat"] != "Not found"
+        else
+        "The uploaded reports did not provide enough risk evidence to identify a defensible biggest threat."
+    )
 
     return {
-        "size": extract_ibis_size_growth(ibis_name, ibis_pages),
-        "golf_growth": extract_barnes_growth(barnes_name, barnes_pages),
-        "retail_context": extract_kentley_context(kentley_name, kentley_pages),
-        "competitors": extract_competitors(ibis_name, ibis_pages, company),
-        "regulation": extract_regulation(ibis_name, ibis_pages),
-        "supply_chain": extract_supply_chain(ibis_name, ibis_pages),
-        "customers": extract_customer(ibis_name, ibis_pages),
-        "end_users": extract_barnes_end_users(barnes_name, barnes_pages),
-        "trend": extract_trend(ibis_name, ibis_pages, barnes_name, barnes_pages),
-        "threat": extract_threat(ibis_name, ibis_pages, barnes_name, barnes_pages),
+        "size": size,
+        "golf_growth": golf_growth,
+        "retail_context": retail_context,
+        "competitors": competitors,
+        "regulation": regulation,
+        "supply_chain": supply_chain,
+        "customers": customers,
+        "end_users": end_users,
+        "trend": trend,
+        "threat": threat,
+        "summaries": {
+            "size": size_summary,
+            "growth": growth_summary,
+            "competitors": competitors_summary,
+            "regulation": regulation_summary,
+            "supply_chain": supply_summary,
+            "customers": customers_summary,
+            "trend": trend_summary,
+            "threat": threat_summary,
+        }
     }
+
 
 # ============================================================
 # EXPORT
@@ -532,6 +708,8 @@ def brief_markdown(company, chosen, alt, b):
         "",
         f"**Golf-equipment retail cross-check:** {k['global_sales_2025']} in 2025 → {k['global_sales_2029']} in 2029; calculated CAGR {k['calculated_cagr']}.",
         f"**Source:** {k['source']}",
+        "",
+        f"**Summary:** {b['summaries']['size']} {b['summaries']['growth']}",
         ""
     ]
 
@@ -540,20 +718,21 @@ def brief_markdown(company, chosen, alt, b):
         lines.append(f"- **{x['company']}** — estimated market share **{x['market_share']}** — Source: {x['source']}")
     lines += [
         "",
-        "**Important limitation:** The IBISWorld PDF reports exact shares for some companies and ranges for others. "
-        "Range estimates are shown as reported rather than converted into invented point estimates.",
+        "**Important limitation:** Exact percentages and ranges are preserved as reported rather than converted into invented point estimates.",
+        "",
+        f"**Summary:** {b['summaries']['competitors']}",
         ""
     ]
 
     lines += ["## Regulatory / Compliance Pressure"]
     for x in b["regulation"]:
         lines.append(f"- {x['text']} — Source: {x['source']}")
-    lines.append("")
+    lines += ["", f"**Summary:** {b['summaries']['regulation']}", ""]
 
     lines += ["## Supply-Chain Concentration or Fragility"]
     for x in b["supply_chain"]:
         lines.append(f"- {x['text']} — Source: {x['source']}")
-    lines.append("")
+    lines += ["", f"**Summary:** {b['summaries']['supply_chain']}", ""]
 
     c=b["customers"]
     lines += [
@@ -565,7 +744,9 @@ def brief_markdown(company, chosen, alt, b):
     for x in c["evidence"]:
         lines.append(f"- {x['text']} — Source: {x['source']}")
     lines += [
-        f"- Golf-specific end-user evidence: {b['end_users']['text']} — Source: {b['end_users']['source']}",
+        f"- End-user evidence: {b['end_users']['text']} — Source: {b['end_users']['source']}",
+        "",
+        f"**Summary:** {b['summaries']['customers']}",
         ""
     ]
 
@@ -577,7 +758,7 @@ def brief_markdown(company, chosen, alt, b):
     ]
     for x in t["evidence"]:
         lines.append(f"- {x['text']} — Source: {x['source']}")
-    lines.append("")
+    lines += ["", f"**Summary:** {b['summaries']['trend']}", ""]
 
     th=b["threat"]
     lines += [
@@ -587,7 +768,7 @@ def brief_markdown(company, chosen, alt, b):
     ]
     for x in th["evidence"]:
         lines.append(f"- {x['text']} — Source: {x['source']}")
-    lines.append("")
+    lines += ["", f"**Summary:** {b['summaries']['threat']}", ""]
 
     missing=[]
     if len(b["competitors"])<3:
@@ -649,10 +830,10 @@ with col1:
     st.caption("Automatically finds and verifies the best-fit NAICS code using the U.S. Census manual.")
 with col2:
     st.markdown("### 📚 Evidence")
-    st.caption("Searches your uploaded reports for the strongest evidence for every required assignment signal.")
+    st.caption("Searches uploaded reports for the strongest evidence for every required industry signal.")
 with col3:
     st.markdown("### 📝 Brief")
-    st.caption("Returns sourced findings plus a short summary at the end of every section.")
+    st.caption("Returns sourced findings plus a paragraph summary at the end of every section.")
 
 st.divider()
 
@@ -666,7 +847,7 @@ uploads = st.file_uploader(
     accept_multiple_files=True,
     label_visibility="collapsed"
 )
-st.caption("Upload any relevant industry reports. The tool looks for similar information even when the report titles and formats differ.")
+st.caption("Upload any relevant industry reports. The tool looks for similar evidence even when report titles and formats differ.")
 
 run = st.button("Build Industry Brief", type="primary", use_container_width=True, disabled=(not company or not uploads))
 
