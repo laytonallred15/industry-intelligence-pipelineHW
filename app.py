@@ -11,8 +11,6 @@ from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 
 st.set_page_config(page_title="Industry Intelligence Pipeline", page_icon="📊", layout="wide")
-st.title("📊 Industry Intelligence Pipeline")
-st.caption("Built for the assignment: company → NAICS → three industry reports → sourced industry brief")
 
 CENSUS_MANUAL_URL = "https://www.census.gov/naics/reference_files_tools/2022_NAICS_Manual.pdf"
 
@@ -202,15 +200,20 @@ def rank_naics(company):
 # IDENTIFY THE THREE REPORT TYPES
 # ============================================================
 
-def classify_report(filename, pages):
-    sample = " ".join(x["text"] for x in pages[:8]).lower()
-    if "ibisworld" in sample and "athletic" in sample and "sporting goods" in sample:
-        return "ibis"
-    if "barnes reports" in sample and "golf equipment and apparel" in sample:
-        return "barnes"
-    if "kentley insights" in sample and "golf equipment retail sales" in sample:
-        return "kentley"
-    return "other"
+def select_report(report_data, keywords):
+    """Pick the uploaded report that best matches a type of evidence.
+    The same report may serve more than one role, so the tool can work with different report sets.
+    """
+    best=None
+    best_score=-1
+    for name,pages in report_data:
+        text=" ".join(p["text"] for p in pages[:20]).lower()
+        score=sum(2 for k in keywords if k.lower() in text)
+        score += sum(1 for k in keywords for p in pages[20:] if k.lower() in p["text"].lower())
+        if score>best_score:
+            best_score=score
+            best=(name,pages)
+    return best
 
 # ============================================================
 # ASSIGNMENT EXTRACTION
@@ -218,61 +221,71 @@ def classify_report(filename, pages):
 
 def extract_ibis_size_growth(name, pages):
     result = {
-        "industry_size":"Not found",
-        "industry_size_year":"Not found",
-        "historic_cagr":"Not found",
-        "historic_period":"Not found",
-        "forecast_cagr":"Not found",
-        "forecast_period":"Not found",
-        "source":"Not found"
+        "industry_size":"Not found","industry_size_year":"Not found",
+        "historic_cagr":"Not found","historic_period":"Not found",
+        "forecast_cagr":"Not found","forecast_period":"Not found","source":"Not found"
     }
+    # First, preserve the strong IBISWorld format when present.
     for row in pages:
-        text = row["text"]
+        text=row["text"]
         if "Revenue" in text and "2020-25" in text and "2025-30" in text:
-            m_size = re.search(r"Revenue\s*\$?([\d.]+)\s*(bn|billion|m|million)", text, re.I)
-            m_hist = re.search(r"2020[-–]25\s*[^\d-]*(-?\d+(?:\.\d+)?)%", text)
-            # Find the first 2025-30 percentage after the revenue block
-            revpos = text.find("Revenue")
-            chunk = text[revpos:revpos+500]
-            m_fc = re.search(r"2025[-–]30\s*[^\d-]*(-?\d+(?:\.\d+)?)%", chunk)
+            m_size=re.search(r"Revenue\s*\$?([\d.]+)\s*(bn|billion|m|million)",text,re.I)
+            revpos=text.find("Revenue"); chunk=text[revpos:revpos+500]
+            m_hist=re.search(r"2020[-–]25\s*[^\d-]*(-?\d+(?:\.\d+)?)%",chunk)
+            m_fc=re.search(r"2025[-–]30\s*[^\d-]*(-?\d+(?:\.\d+)?)%",chunk)
             if m_size:
-                result["industry_size"] = f"${m_size.group(1)}{m_size.group(2)}"
-                result["industry_size_year"] = "2025"
+                result["industry_size"]=f"${m_size.group(1)}{m_size.group(2)}"; result["industry_size_year"]="2025"
             if m_hist:
-                result["historic_cagr"] = m_hist.group(1)+"%"
-                result["historic_period"] = "2020-2025"
+                result["historic_cagr"]=m_hist.group(1)+"%"; result["historic_period"]="2020-2025"
             if m_fc:
-                result["forecast_cagr"] = m_fc.group(1)+"%"
-                result["forecast_period"] = "2025-2030"
-            result["source"] = page_source(name, row["page"])
+                result["forecast_cagr"]=m_fc.group(1)+"%"; result["forecast_period"]="2025-2030"
+            result["source"]=page_source(name,row["page"])
+            return result
+
+    # Generic fallback for other industry reports.
+    for row in find_pages_any(pages,["market size","industry revenue","revenue","sales"]):
+        text=row["text"]
+        m=re.search(r"(?:market size|industry revenue|revenue|sales)[^$]{0,80}\$?([\d,.]+)\s*(bn|billion|mn|million|m)\b",text,re.I)
+        if m:
+            result["industry_size"]=f"${m.group(1)}{m.group(2)}"
+            near=text[max(0,m.start()-120):m.end()+140]
+            yrs=re.findall(r"20\d{2}",near)
+            result["industry_size_year"]=max(yrs) if yrs else "Most recent reported year"
+            result["source"]=page_source(name,row["page"])
             break
     return result
 
+
 def extract_barnes_growth(name, pages):
-    result = {
-        "market_size_2026":"Not found",
-        "projected_2032":"Not found",
-        "five_year_cagr":"Not found",
-        "period":"Not found",
-        "source":"Not found"
-    }
+    result={"market_size_2026":"Not found","projected_2032":"Not found","five_year_cagr":"Not found","period":"Not found","source":"Not found"}
+    candidates=[]
     for row in pages:
-        text = row["text"]
-        if "CAGR 2027-2032" in text:
-            m26 = re.search(r"2026\s+([\d,]+(?:\.\d+)?)\s*-", text)
-            m32 = re.search(r"2032\s+([\d,]+(?:\.\d+)?)\s*-", text)
-            mc = re.search(r"CAGR\s+2027[-–]2032\s+(-?\d+(?:\.\d+)?)%", text, re.I)
-            if m26:
-                # Barnes table is in thousands of dollars
-                result["market_size_2026"] = fmt_billions(float(m26.group(1).replace(",",""))*1000)
-            if m32:
-                result["projected_2032"] = fmt_billions(float(m32.group(1).replace(",",""))*1000)
-            if mc:
-                result["five_year_cagr"] = mc.group(1)+"%"
-                result["period"] = "2027-2032"
-            result["source"] = page_source(name, row["page"])
-            break
+        text=row["text"]
+        for m in re.finditer(r"CAGR\s+(20\d{2})[-–](20\d{2})\s+(-?\d+(?:\.\d+)?)%",text,re.I):
+            y1,y2,pct=int(m.group(1)),int(m.group(2)),float(m.group(3))
+            context=text[max(0,m.start()-220):m.end()+220].lower()
+            if any(x in context for x in ["price","payroll","wage","employee"]):
+                continue
+            score=(10 if 4<=y2-y1<=6 else 0)+(6 if "market" in context or "revenue" in context else 0)+(4 if y2>=2030 else 0)
+            candidates.append((score,row,y1,y2,pct))
+    if candidates:
+        candidates.sort(key=lambda x:x[0],reverse=True)
+        _,row,y1,y2,pct=candidates[0]
+        result["five_year_cagr"]=f"{pct:.1f}%"; result["period"]=f"{y1}-{y2}"; result["source"]=page_source(name,row["page"])
+        # Try to capture market values for the start/recent and end year on the same page.
+        text=row["text"]
+        for yr,key in [(2026,"market_size_2026"),(y2,"projected_2032")]:
+            m=re.search(rf"{yr}\s+([\d,]+(?:\.\d+)?)\s*-",text)
+            if m:
+                result[key]=fmt_billions(float(m.group(1).replace(',',''))*1000)
+        return result
+    # Fallback: forecast/expected CAGR wording.
+    for row in find_pages_any(pages,["forecast","growth","cagr","outlook"]):
+        m=re.search(r"(?:forecast|expected)[^.]{0,160}?(-?\d+(?:\.\d+)?)%\s*(?:CAGR|annualized)",row["text"],re.I)
+        if m:
+            result["five_year_cagr"]=m.group(1)+"%"; result["period"]="Forecast period stated in report"; result["source"]=page_source(name,row["page"]); break
     return result
+
 
 def extract_kentley_context(name, pages):
     result = {
@@ -300,45 +313,43 @@ def extract_kentley_context(name, pages):
     return result
 
 def extract_competitors(name, pages, target_company):
-    # Pull directly from IBIS company market share tables.
-    rows = []
-    seen = set()
-
-    for row in pages:
-        text = row["text"]
-        if "Company Market Share (%)" not in text:
-            continue
-
-        patterns = [
-            (r"Acushnet Holdings Corp\.\s+6\.6", "Acushnet Holdings Corp.", "6.6%"),
-            (r"Callaway Golf\s+5\.7", "Callaway Golf", "5.7%"),
-            (r"Titleist\s+2\.5[-–]5", "Titleist", "2.5–5.0%"),
-            (r"Coleman\s+0[-–]2\.5", "Coleman", "0–2.5%"),
-            (r"Taylormade Golf\s+0[-–]2\.5", "TaylorMade Golf", "0–2.5%"),
-            (r"Wilson Sporting Goods\s+0[-–]2\.5", "Wilson Sporting Goods", "0–2.5%"),
-            (r"Sport Dimension\s+0[-–]2\.5", "Sport Dimension", "0–2.5%"),
+    rows=[]; seen=set()
+    table_pages=find_pages_any(pages,["company market share","market share by company","major players","competitive landscape","key players"])
+    # Generic exact percentages and ranges.
+    for row in table_pages:
+        text=row["text"]
+        patterns=[
+            r"([A-Z][A-Za-z0-9&'.,\- ]{2,55}?)\s+(?:\(\$?[\d,.]+[mkbn]*\)\s+)?(\d+(?:\.\d+)?)%",
+            r"([A-Z][A-Za-z0-9&'.,\- ]{2,55}?)\s+(\d+(?:\.\d+)?\s*[-–]\s*\d+(?:\.\d+)?)\b"
         ]
-        for patt, company, share in patterns:
-            if re.search(patt, text, re.I) and company.lower() not in seen:
-                seen.add(company.lower())
-                rows.append({
-                    "company":company,
-                    "market_share":share,
-                    "source":page_source(name,row["page"])
-                })
+        for patt in patterns:
+            for m in re.finditer(patt,text):
+                company=clean(m.group(1)).strip(' .,-'); share=clean(m.group(2))
+                if any(x in company.lower() for x in ["market share","other companies","revenue","annual growth","regional share","company market share"]): continue
+                if len(company.split())>8: continue
+                if '%' not in share: share=share.replace(' ','')+'%'
+                if company.lower() not in seen:
+                    seen.add(company.lower()); rows.append({"company":company,"market_share":share,"source":page_source(name,row["page"])})
+        # Strong compressed-table fallback for the current IBISWorld report.
+        special=[
+            (r"Acushnet Holdings Corp\.?\s+(?:\(\$?[\d,.]+m\)\s+)?6\.6","Acushnet Holdings Corp.","6.6%"),
+            (r"Callaway Golf\s+(?:\(\$?[\d,.]+m\)\s+)?5\.7","Callaway Golf","5.7%"),
+            (r"Titleist\s+2\.5[-–]5","Titleist","2.5–5.0%"),
+            (r"Taylormade Golf\s+0[-–]2\.5","TaylorMade Golf","0–2.5%"),
+            (r"Wilson Sporting Goods\s+0[-–]2\.5","Wilson Sporting Goods","0–2.5%")]
+        for patt,c,s in special:
+            if re.search(patt,text,re.I) and c.lower() not in seen:
+                seen.add(c.lower()); rows.append({"company":c,"market_share":s,"source":page_source(name,row["page"])})
 
-    # Exclude the target company itself.
-    target_tokens = target_company.lower()
-    filtered = []
-    for r in rows:
-        if "callaway" in target_tokens and "callaway" in r["company"].lower():
-            continue
-        filtered.append(r)
+    def share_rank(x):
+        nums=[float(n) for n in re.findall(r"\d+(?:\.\d+)?",x["market_share"])]
+        return max(nums) if nums else 0
+    target_words=[w for w in re.findall(r"[a-z0-9]+",target_company.lower()) if len(w)>3]
+    target=[x for x in rows if any(w in x["company"].lower() for w in target_words)]
+    others=[x for x in rows if x not in target]
+    target.sort(key=share_rank,reverse=True); others.sort(key=share_rank,reverse=True)
+    return (target[:1]+others)[:5]
 
-    # Prioritize golf-relevant names.
-    priority = {"Acushnet Holdings Corp.":1, "Titleist":2, "TaylorMade Golf":3, "Wilson Sporting Goods":4, "Coleman":5}
-    filtered.sort(key=lambda x: priority.get(x["company"],99))
-    return filtered[:5]
 
 def extract_regulation(name, pages):
     hits = sentence_candidates(
@@ -392,14 +403,17 @@ def extract_customer(name, pages):
 
 def extract_barnes_end_users(name, pages):
     for row in pages:
-        if "Market End Users" in row["text"]:
-            txt = row["text"]
-            anchor = txt.find("Market End Users")
-            end = txt.find("Market Drivers", anchor)
-            if end < 0:
-                end = min(len(txt), anchor+1500)
-            return {"text":clean(txt[anchor:end]), "source":page_source(name,row["page"])}
-    return {"text":"Not found", "source":"Not found"}
+        txt=row["text"]
+        for heading in ["Market End Users","End Users","Customers","Major Markets"]:
+            if heading.lower() in txt.lower():
+                idx=txt.lower().find(heading.lower())
+                snippet=clean(txt[idx:idx+1400])
+                return {"text":snippet,"source":page_source(name,row["page"])}
+    hits=sentence_candidates(pages,["customers","buyers","recreational","professional","retailers","end-users"],max_items=2)
+    if hits:
+        return {"text":" ".join(h["text"] for h in hits),"source":page_source(name,hits[0]["page"])}
+    return {"text":"Not found","source":"Not found"}
+
 
 def extract_trend(ibis_name, ibis_pages, barnes_name, barnes_pages):
     evidence = []
@@ -626,35 +640,30 @@ def markdown_pdf(md):
 # UI
 # ============================================================
 
-st.subheader("1. Company")
-company = st.text_input("Company name", value="Callaway Golf Company")
+st.title("Company Name")
+company = st.text_input("Company name", placeholder="Example: Callaway Golf Company", label_visibility="collapsed")
 
-st.subheader("2. Upload the three reports")
+st.title("Upload Reports")
 uploads = st.file_uploader(
-    "Upload the IBISWorld, Barnes Reports, and Kentley Insights PDFs",
+    "Upload industry reports",
     type=["pdf"],
-    accept_multiple_files=True
-)
-st.caption(
-    "Designed for: (1) IBISWorld Athletic & Sporting Goods Manufacturing in the US, "
-    "(2) Barnes 2026 Golf Equipment and Apparel Outlook, and "
-    "(3) Kentley Insights Golf Equipment Retail Sales."
+    accept_multiple_files=True,
+    label_visibility="collapsed"
 )
 
-run = st.button("🚀 Build Industry Brief", type="primary", use_container_width=True, disabled=(not company or len(uploads)<3))
+run = st.button("Build Industry Brief", type="primary", use_container_width=True, disabled=(not company or not uploads))
 
 if run:
-    reports={}
-    with st.spinner("Reading and classifying the three reports..."):
+    report_data=[]
+    with st.spinner("Reading uploaded reports..."):
         for upload in uploads:
-            pages=read_pdf(upload)
-            typ=classify_report(upload.name,pages)
-            if typ in ("ibis","barnes","kentley"):
-                reports[typ]=(upload.name,pages)
+            try:
+                report_data.append((upload.name,read_pdf(upload)))
+            except Exception as e:
+                st.warning(f"Could not read {upload.name}: {e}")
 
-    missing_types=[x for x in ["ibis","barnes","kentley"] if x not in reports]
-    if missing_types:
-        st.error("I could not identify all three required report types. Missing: "+", ".join(missing_types))
+    if not report_data:
+        st.error("No readable report content was found.")
         st.stop()
 
     with st.spinner("Finding and verifying NAICS..."):
@@ -664,8 +673,8 @@ if run:
             profile, ranked = "", []
             st.warning(f"Automatic NAICS lookup had a problem: {e}")
 
-    with st.spinner("Extracting only the information required by the assignment..."):
-        brief=build_brief(company,reports)
+    with st.spinner("Finding the assignment signals in the uploaded reports..."):
+        brief=build_brief(company,report_data)
 
     st.session_state["company"]=company
     st.session_state["ranked"]=ranked
@@ -724,6 +733,7 @@ if "brief" in st.session_state:
         f"(calculated CAGR {k['calculated_cagr']})."
     )
     st.caption(k["source"])
+    st.info("Summary: "+b["summaries"]["size"]+" "+b["summaries"]["growth"])
 
     # Competitors
     st.subheader("Top Competitors and Market Share Estimates")
@@ -735,16 +745,19 @@ if "brief" in st.session_state:
         st.caption("Exact percentages and ranges are preserved exactly as IBISWorld reports them; the tool does not invent point estimates.")
     else:
         st.warning("No named competitor share estimates found.")
+    st.info("Summary: "+b["summaries"]["competitors"])
 
     # Regulation
     st.subheader("Regulatory / Compliance Pressure")
     for x in b["regulation"]:
         st.write("• "+x["text"]); st.caption(x["source"])
+    st.info("Summary: "+b["summaries"]["regulation"])
 
     # Supply
     st.subheader("Supply-Chain Concentration or Fragility")
     for x in b["supply_chain"]:
         st.write("• "+x["text"]); st.caption(x["source"])
+    st.info("Summary: "+b["summaries"]["supply_chain"])
 
     # Customer
     st.subheader("Customer Concentration or Fragmentation")
@@ -757,6 +770,7 @@ if "brief" in st.session_state:
     st.markdown("**Golf-specific end users:**")
     st.write(b["end_users"]["text"])
     st.caption(b["end_users"]["source"])
+    st.info("Summary: "+b["summaries"]["customers"])
 
     # Trend
     st.subheader("Biggest Trend of the Next Five Years")
@@ -765,6 +779,7 @@ if "brief" in st.session_state:
     st.write(t["interpretation"])
     for x in t["evidence"]:
         st.write("• "+x["text"]); st.caption(x["source"])
+    st.info("Summary: "+b["summaries"]["trend"])
 
     # Threat
     st.subheader("Biggest Threat")
@@ -773,11 +788,12 @@ if "brief" in st.session_state:
     st.write(th["interpretation"])
     for x in th["evidence"]:
         st.write("• "+x["text"]); st.caption(x["source"])
+    st.info("Summary: "+b["summaries"]["threat"])
 
     # Missing
     st.subheader("What the Pipeline Could Not Find")
     if len(comps)<3:
-        st.write("• The reports do not provide at least three named competitor share estimates.")
+        st.write("• Fewer than three named competitor share estimates were found; a more detailed competitive-landscape source would be needed.")
     else:
         st.write(
             "• Every required signal is supported by the three reports. Competitor shares are partly reported as ranges, "
