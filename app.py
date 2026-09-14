@@ -1,408 +1,294 @@
-
 import streamlit as st
 import pandas as pd
 from pypdf import PdfReader
-from ddgs import DDGS
-import re
-import time
+from docx import Document
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
 from io import BytesIO
+import re, os
 
-st.set_page_config(
-    page_title="Industry Intelligence Pipeline",
-    page_icon="📊",
-    layout="wide"
-)
-
+st.set_page_config(page_title="Industry Intelligence Pipeline", page_icon="📊", layout="wide")
 st.title("📊 Industry Intelligence Pipeline")
-st.caption("Enter a company, upload industry reports, and generate a structured, traceable industry brief.")
+st.caption("Upload company and industry evidence, then generate a structured, traceable industry brief.")
+st.info("This tool analyzes only the files you upload. Every extracted signal is tied to a document and page/section. Missing evidence is flagged instead of invented.")
 
-st.info(
-    "This tool is designed for traceability. It does not invent unsupported numbers. "
-    "Search snippets are treated as leads, and uploaded report evidence is shown with document/page references."
-)
-
-# -----------------------------
-# Helpers
-# -----------------------------
 def clean_text(text):
     return re.sub(r"\s+", " ", text or "").strip()
 
-def extract_pdf_pages(uploaded_file):
-    reader = PdfReader(uploaded_file)
+def split_sentences(text):
+    text = clean_text(text)
+    return [p.strip() for p in re.split(r'(?<=[.!?])\s+(?=[A-Z0-9])', text) if len(p.strip()) > 25]
+
+def extract_pdf(file):
+    reader = PdfReader(file)
     rows = []
     for i, page in enumerate(reader.pages, start=1):
-        txt = clean_text(page.extract_text())
-        rows.append({
-            "document": uploaded_file.name,
-            "page": i,
-            "text": txt
-        })
+        txt = clean_text(page.extract_text() or "")
+        if txt:
+            rows.append({"document": file.name, "location": f"p. {i}", "page": i, "text": txt})
     return rows
 
-def web_search(query, max_results=5):
-    out = []
+def extract_docx(file):
+    doc = Document(file)
+    txt = clean_text("\n".join(p.text for p in doc.paragraphs if p.text.strip()))
+    return [{"document": file.name, "location": "document", "page": None, "text": txt}] if txt else []
+
+def extract_txt(file):
+    data = file.read()
     try:
-        with DDGS() as ddgs:
-            for r in ddgs.text(query, max_results=max_results):
-                out.append({
-                    "title": clean_text(r.get("title", "")),
-                    "url": r.get("href", ""),
-                    "snippet": clean_text(r.get("body", "")),
-                    "query": query
-                })
-    except Exception as e:
-        out.append({
-            "title": "Search error",
-            "url": "",
-            "snippet": str(e),
-            "query": query
-        })
-    return out
+        txt = data.decode("utf-8")
+    except Exception:
+        txt = data.decode("latin-1", errors="ignore")
+    txt = clean_text(txt)
+    return [{"document": file.name, "location": "document", "page": None, "text": txt}] if txt else []
 
-def dedupe_results(rows):
-    seen = set()
-    out = []
-    for r in rows:
-        key = r.get("url") or (r.get("title"), r.get("snippet"))
-        if key not in seen:
-            seen.add(key)
-            out.append(r)
-    return out
+def extract_csv(file):
+    df = pd.read_csv(file)
+    txt = clean_text(df.astype(str).to_csv(index=False))
+    return [{"document": file.name, "location": "table", "page": None, "text": txt}] if txt else []
 
-def score_page(text, keywords):
-    t = text.lower()
-    return sum(t.count(k.lower()) for k in keywords)
+def read_upload(file):
+    ext = os.path.splitext(file.name.lower())[1]
+    if ext == ".pdf": return extract_pdf(file)
+    if ext == ".docx": return extract_docx(file)
+    if ext in [".txt", ".md"]: return extract_txt(file)
+    if ext == ".csv": return extract_csv(file)
+    return []
 
-def best_pdf_evidence(pages, keywords, limit=4):
-    scored = []
+def chunk_pages(pages, chunk_size=1400, overlap=200):
+    chunks = []
     for p in pages:
-        s = score_page(p["text"], keywords)
-        if s > 0:
-            scored.append((s, p))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    results = []
-    for _, p in scored[:limit]:
         text = p["text"]
-        # Find a useful excerpt near the first keyword
-        lower = text.lower()
-        pos = -1
-        for k in keywords:
-            pos = lower.find(k.lower())
-            if pos != -1:
-                break
-        if pos == -1:
-            pos = 0
-        start = max(0, pos - 220)
-        end = min(len(text), pos + 700)
-        excerpt = text[start:end].strip()
-        results.append({
-            "document": p["document"],
-            "page": p["page"],
-            "excerpt": excerpt
-        })
-    return results
+        if len(text) <= chunk_size:
+            chunks.append(dict(p))
+        else:
+            start = 0
+            while start < len(text):
+                end = min(len(text), start + chunk_size)
+                chunks.append({"document": p["document"], "location": p["location"], "page": p["page"], "text": text[start:end]})
+                if end == len(text): break
+                start = max(start + 1, end - overlap)
+    return chunks
 
-def top_web_evidence(results, limit=4):
-    return results[:limit]
+def build_index(chunks):
+    corpus = [c["text"] for c in chunks]
+    if not corpus: return None, None
+    v = TfidfVectorizer(stop_words="english", ngram_range=(1,2), max_features=30000)
+    m = v.fit_transform(corpus)
+    return v, m
 
-def source_line_for_web(r):
-    if r.get("url"):
-        return f'{r.get("title","Source")} — {r.get("url")}'
-    return r.get("title", "Source")
+def retrieve(query, chunks, vectorizer, matrix, top_k=10):
+    if not chunks or vectorizer is None: return []
+    q = vectorizer.transform([query])
+    sims = cosine_similarity(q, matrix)[0]
+    idx = sims.argsort()[::-1][:top_k]
+    out = []
+    for i in idx:
+        if sims[i] <= 0: continue
+        row = dict(chunks[i]); row["score"] = float(sims[i]); out.append(row)
+    return out
 
-def make_markdown(company, brief):
-    md = [f"# Industry Intelligence Brief: {company}\n"]
-    md.append("## Proposed NAICS Classification\n")
-    md.append(brief["naics"]["summary"] or "Not yet verified.")
-    md.append("\n\n**Source leads:**")
-    for s in brief["naics"]["web"]:
-        md.append(f"- {source_line_for_web(s)}")
-    md.append("\n> Verify the final code against the official U.S. Census NAICS manual.\n")
+MONEY = r"(?:\$|US\$)?\s?\d[\d,]*(?:\.\d+)?\s?(?:billion|million|trillion|bn|mn|B|M)?"
+PERCENT = r"\b\d+(?:\.\d+)?\s?%"
+YEAR = r"\b(?:19|20)\d{2}\b"
+NAICS_CODE = r"\b\d{6}\b"
 
-    for key, title in [
-        ("industry_size", "Industry Size and Five-Year Growth Trajectory"),
-        ("competitors", "Top Competitors and Market Share Estimates"),
-        ("regulation", "Regulatory or Compliance Pressure"),
-        ("supply_chain", "Supply Chain Concentration or Fragility"),
-        ("customers", "Customer Concentration or Fragmentation"),
-        ("trend", "Biggest Trend of the Next Five Years"),
-        ("threat", "Biggest Threat"),
-    ]:
-        item = brief[key]
-        md.append(f"\n## {title}\n")
-        md.append(item["summary"] or "No verified conclusion generated automatically.")
-        if item["pdf"]:
-            md.append("\n\n**Uploaded report evidence:**")
-            for p in item["pdf"]:
-                md.append(f'- {p["document"]}, p. {p["page"]}: {p["excerpt"]}')
-        if item["web"]:
-            md.append("\n\n**Public web source leads:**")
-            for w in item["web"]:
-                md.append(f"- {w.get('snippet','')}\n  - {source_line_for_web(w)}")
+def sentence_score(sentence, keywords, patterns):
+    s = sentence.lower()
+    score = sum(2 for k in keywords if k.lower() in s)
+    for pat in patterns:
+        if re.search(pat, sentence, flags=re.I): score += 3
+    return score
 
-    md.append("\n## What the Pipeline Could Not Find\n")
-    missing = []
-    for key, title in [
-        ("industry_size", "industry size / growth"),
-        ("competitors", "competitors / market share"),
-        ("regulation", "regulatory pressure"),
-        ("supply_chain", "supply-chain evidence"),
-        ("customers", "customer concentration"),
-        ("trend", "five-year trend"),
-        ("threat", "industry threat")
-    ]:
-        item = brief[key]
-        if not item["pdf"] and not item["web"]:
-            missing.append(title)
-    if missing:
-        for x in missing:
-            md.append(f"- {x}: additional industry-report or primary-source evidence is needed.")
+def best_sentences(hits, keywords, patterns, limit=4):
+    candidates, seen = [], set()
+    for h in hits:
+        for sent in split_sentences(h["text"]):
+            key = sent.lower()
+            if key in seen: continue
+            seen.add(key)
+            score = sentence_score(sent, keywords, patterns)
+            if score > 0:
+                candidates.append({"sentence": sent, "score": score, "document": h["document"], "location": h["location"], "page": h["page"]})
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    return candidates[:limit]
+
+def citation(e):
+    return f'{e["document"]}, {e["location"]}'
+
+def unique_citations(evidence):
+    out, seen = [], set()
+    for e in evidence:
+        c = citation(e)
+        if c not in seen:
+            seen.add(c); out.append(c)
+    return out
+
+SIGNALS = {
+    "industry_size": {"label":"Industry Size","query":"industry market size total revenue market value sales","keywords":["market size","industry revenue","market value","sales","revenue","industry size"],"patterns":[MONEY,YEAR]},
+    "growth": {"label":"Five-Year Growth Trajectory","query":"five year growth historical growth CAGR annualized growth forecast","keywords":["growth","cagr","annualized","five-year","five year","forecast"],"patterns":[PERCENT,YEAR]},
+    "competitors": {"label":"Top Competitors and Market Share Estimates","query":"major companies competitors market share leading companies concentration","keywords":["market share","competitor","major companies","leading companies","largest company","concentration"],"patterns":[PERCENT]},
+    "regulation": {"label":"Regulatory or Compliance Pressure","query":"regulation regulatory compliance law government safety environmental import tariff","keywords":["regulation","regulatory","compliance","law","government","environmental","tariff","safety"],"patterns":[]},
+    "supply_chain": {"label":"Supply Chain Concentration or Fragility","query":"supply chain suppliers raw materials imports sourcing concentration shortage logistics","keywords":["supply chain","supplier","raw material","import","sourcing","shortage","logistics","concentration"],"patterns":[PERCENT]},
+    "customers": {"label":"Customer Concentration or Fragmentation","query":"customers buyers market segments customer concentration downstream demand","keywords":["customer","buyer","market segment","downstream","consumer","concentration","demand"],"patterns":[PERCENT]},
+    "trend": {"label":"Biggest Trend of the Next Five Years","query":"future outlook five years trend forecast technology ecommerce participation premiumization sustainability","keywords":["trend","outlook","forecast","future","five years","five-year","driver","expected"],"patterns":[PERCENT,YEAR]},
+    "threat": {"label":"Biggest Threat","query":"industry threat risk challenge decline substitutes competition economic downturn cost pressure","keywords":["threat","risk","challenge","decline","substitute","competition","pressure","downturn","cost"],"patterns":[]}
+}
+
+def extract_naics_candidates(company, desc, chunks, v, m):
+    hits = retrieve(f"{company} {desc} NAICS classification primary business industry description establishments primarily engaged", chunks, v, m, 15)
+    candidates, seen = [], set()
+    for h in hits:
+        for sent in split_sentences(h["text"]):
+            for code in re.findall(NAICS_CODE, sent):
+                key = (code, sent[:180])
+                if key in seen: continue
+                seen.add(key)
+                candidates.append({"code":code,"description":sent,"document":h["document"],"location":h["location"],"score":h["score"]})
+    candidates.sort(key=lambda x:x["score"], reverse=True)
+    return candidates[:8]
+
+def build_brief(company, desc, chunks, v, m):
+    result = {"company":company,"naics_candidates":extract_naics_candidates(company, desc, chunks, v, m),"signals":{},"missing":[]}
+    for key,cfg in SIGNALS.items():
+        hits = retrieve(cfg["query"], chunks, v, m, 12)
+        evidence = best_sentences(hits, cfg["keywords"], cfg["patterns"], 4)
+        summary = " ".join(e["sentence"] for e in evidence) if evidence else "Not found in uploaded files."
+        result["signals"][key] = {"label":cfg["label"],"summary":summary,"evidence":evidence,"sources":unique_citations(evidence)}
+        if not evidence:
+            result["missing"].append({"signal":cfg["label"],"needed":"A source that directly addresses this signal."})
+    if not result["naics_candidates"]:
+        result["missing"].append({"signal":"NAICS Code","needed":"Relevant U.S. Census NAICS manual pages or another authoritative NAICS source."})
+    return result
+
+def render_markdown(brief, selected_naics, neighboring_naics, naics_reason, neighbor_reason):
+    md = [f"# Industry Intelligence Brief: {brief['company']}", "", "## NAICS Classification",
+          f"**Selected NAICS code:** {selected_naics or 'Not selected'}", "",
+          f"**Why this code:** {naics_reason or 'Not completed'}", "",
+          f"**Neighboring code considered:** {neighboring_naics or 'Not selected'}", "",
+          f"**Why not the neighboring code:** {neighbor_reason or 'Not completed'}", "",
+          "**NAICS verification:** Final selection should be checked against the official U.S. Census NAICS manual.", ""]
+    for key in ["industry_size","growth","competitors","regulation","supply_chain","customers","trend","threat"]:
+        item = brief["signals"][key]
+        md += [f"## {item['label']}", item["summary"], ""]
+        if item["sources"]:
+            md.append("**Sources:**")
+            md += [f"- {s}" for s in item["sources"]]
+        else:
+            md.append("**Source:** Not found in uploaded files.")
+        md.append("")
+    md.append("## What the Pipeline Could Not Find")
+    if brief["missing"]:
+        md += [f"- **{m['signal']}** — Needed: {m['needed']}" for m in brief["missing"]]
     else:
-        md.append("- No category was completely empty, but all important claims should still be verified against the underlying sources.")
-
-    md.append("""
-## Method and Limitation Note
-
-The pipeline uses targeted public-web searches plus keyword-based extraction from uploaded industry reports.
-It preserves source titles/URLs for web evidence and document/page numbers for uploaded PDFs.
-The tool intentionally does not convert an unverified search snippet into a definitive industry statistic.
-Final numbers, market shares, and NAICS classifications should be checked against the underlying source before submission.
-""")
+        md.append("- No required category was completely missing from the uploaded evidence.")
+    md += ["", "## Method / Traceability Note",
+           "The pipeline searches the uploaded documents using TF-IDF retrieval, then selects the most relevant sentences for each required signal. Each extracted claim keeps the original document and page/section location. The tool does not create unsupported numbers; if evidence is missing, it is reported as missing."]
     return "\n".join(md)
 
-# -----------------------------
-# Input area
-# -----------------------------
-left, right = st.columns([2, 1])
-
-with left:
-    company = st.text_input(
-        "Company name",
-        placeholder="Example: Nike, Tesla, Diamond K Gypsum"
-    )
-
-with right:
-    max_results = st.selectbox(
-        "Web sources per search",
-        [3, 5, 8],
-        index=1
-    )
-
-uploads = st.file_uploader(
-    "Upload IBISWorld / MarketResearch / other industry report PDFs",
-    type=["pdf"],
-    accept_multiple_files=True
-)
-
-run = st.button(
-    "🚀 Run Industry Intelligence Pipeline",
-    type="primary",
-    use_container_width=True,
-    disabled=not company
-)
-
-# -----------------------------
-# Pipeline
-# -----------------------------
-if run:
-    pdf_pages = []
-    for f in uploads:
-        try:
-            pdf_pages.extend(extract_pdf_pages(f))
-        except Exception as e:
-            st.warning(f"Could not read {f.name}: {e}")
-
-    categories = {
-        "naics": {
-            "queries": [
-                f'"{company}" NAICS code',
-                f'"{company}" industry NAICS',
-                f'"{company}" site:census.gov NAICS'
-            ],
-            "keywords": ["NAICS", "primary business", "industry"]
-        },
-        "industry_size": {
-            "queries": [
-                f'"{company}" industry market size five year growth',
-                f'"{company}" industry CAGR market revenue',
-                f'"{company}" industry outlook growth'
-            ],
-            "keywords": ["market size", "industry revenue", "revenue", "growth", "CAGR", "five-year", "five year"]
-        },
-        "competitors": {
-            "queries": [
-                f'"{company}" competitors market share',
-                f'"{company}" major competitors industry market share'
-            ],
-            "keywords": ["market share", "competitor", "major player", "competition", "largest companies"]
-        },
-        "regulation": {
-            "queries": [
-                f'"{company}" industry regulation compliance',
-                f'"{company}" regulatory risks government rules'
-            ],
-            "keywords": ["regulation", "regulatory", "compliance", "law", "EPA", "OSHA", "FDA", "rule"]
-        },
-        "supply_chain": {
-            "queries": [
-                f'"{company}" supply chain risks suppliers raw materials',
-                f'"{company}" supplier concentration supply chain'
-            ],
-            "keywords": ["supplier", "supply chain", "raw material", "input", "shortage", "import", "logistics"]
-        },
-        "customers": {
-            "queries": [
-                f'"{company}" customer concentration customer segments',
-                f'"{company}" major customers industry'
-            ],
-            "keywords": ["customer", "buyer", "client", "end market", "consumer", "concentration"]
-        },
-        "trend": {
-            "queries": [
-                f'"{company}" industry trends next five years',
-                f'"{company}" industry outlook future trends'
-            ],
-            "keywords": ["trend", "outlook", "forecast", "future", "five years", "five-year", "growth driver"]
-        },
-        "threat": {
-            "queries": [
-                f'"{company}" industry threats risks',
-                f'"{company}" competitive risks industry outlook'
-            ],
-            "keywords": ["threat", "risk", "decline", "challenge", "pressure", "competition", "substitute"]
-        }
-    }
-
-    brief = {}
-    progress = st.progress(0)
-    status = st.empty()
-
-    keys = list(categories.keys())
-    for i, key in enumerate(keys, start=1):
-        cfg = categories[key]
-        status.write(f"Researching: {key.replace('_', ' ').title()}")
-
-        web_rows = []
-        for q in cfg["queries"]:
-            web_rows.extend(web_search(q, max_results=max_results))
-            time.sleep(0.15)
-        web_rows = dedupe_results(web_rows)[:max_results]
-
-        pdf_rows = best_pdf_evidence(pdf_pages, cfg["keywords"], limit=4) if pdf_pages else []
-
-        # Conservative auto-summary using evidence snippets rather than fabricated synthesis
-        if pdf_rows:
-            summary = (
-                "Relevant uploaded-report evidence was found. Review the excerpts and use the cited document/page "
-                "to write the final conclusion."
-            )
-        elif web_rows:
-            summary = (
-                "Relevant public-web source leads were found. Open and verify the underlying sources before "
-                "using a statistic or conclusion in the final brief."
-            )
+def markdown_to_pdf(md_text):
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=40,leftMargin=40,topMargin=45,bottomMargin=45)
+    styles = getSampleStyleSheet(); story = []
+    for raw in md_text.splitlines():
+        line = raw.strip()
+        if not line:
+            story.append(Spacer(1,8)); continue
+        if line.startswith("# "): story.append(Paragraph(line[2:], styles["Title"]))
+        elif line.startswith("## "): story.append(Paragraph(line[3:], styles["Heading2"]))
+        elif line.startswith("- "): story.append(Paragraph("• "+line[2:].replace("**",""), styles["BodyText"]))
         else:
-            summary = "No reliable evidence was found automatically."
+            safe = line.replace("**","").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+            story.append(Paragraph(safe, styles["BodyText"]))
+        story.append(Spacer(1,4))
+    doc.build(story); buffer.seek(0); return buffer.getvalue()
 
-        brief[key] = {
-            "summary": summary,
-            "web": web_rows,
-            "pdf": pdf_rows
-        }
+st.subheader("1. Company")
+company = st.text_input("Company name", placeholder="Example: Callaway Golf Company")
+desc = st.text_area("Short company description (recommended)", placeholder="Example: Designs and sells golf clubs, golf balls, bags, accessories, apparel, and related golf products.")
 
-        progress.progress(i / len(keys))
+st.subheader("2. Upload Sources")
+st.write("Upload your IBISWorld report, MarketResearch.com report, relevant Census/NAICS pages, and any other supporting files.")
+uploads = st.file_uploader("Upload PDFs, DOCX, TXT/MD, or CSV files", type=["pdf","docx","txt","md","csv"], accept_multiple_files=True)
+st.caption("Include the Census NAICS pages that contain the likely code and neighboring code so the pipeline can compare them.")
 
-    status.empty()
-    progress.empty()
+run = st.button("🚀 Analyze Uploaded Files", type="primary", use_container_width=True, disabled=not company or not uploads)
+
+if run:
+    pages, errors = [], []
+    with st.spinner("Reading uploaded files..."):
+        for f in uploads:
+            try: pages.extend(read_upload(f))
+            except Exception as e: errors.append(f"{f.name}: {e}")
+    for err in errors: st.warning(err)
+    if not pages:
+        st.error("No readable text was extracted from the uploaded files."); st.stop()
+    chunks = chunk_pages(pages)
+    v,m = build_index(chunks)
+    with st.spinner("Extracting required industry signals..."):
+        brief = build_brief(company, desc, chunks, v, m)
     st.session_state["brief"] = brief
-    st.session_state["company"] = company
-    st.session_state["pdf_pages"] = pdf_pages
-    st.success("Pipeline complete.")
+    st.success("Analysis complete.")
 
-# -----------------------------
-# Results
-# -----------------------------
 if "brief" in st.session_state:
     brief = st.session_state["brief"]
-    company = st.session_state["company"]
-
     st.divider()
-    st.header(f"Structured Industry Brief — {company}")
+    st.header(f"3. Structured Industry Brief — {brief['company']}")
+    st.subheader("NAICS Classification")
+    candidates = brief["naics_candidates"]
+    if candidates:
+        labels = [f'{c["code"]} — {c["description"][:140]}... [{c["document"]}, {c["location"]}]' for c in candidates]
+        selected_label = st.selectbox("Select the best NAICS candidate", labels)
+        idx = labels.index(selected_label); selected = candidates[idx]; selected_naics = selected["code"]
+        st.markdown(f'**Evidence:** {selected["description"]}  \n**Source:** {selected["document"]}, {selected["location"]}')
+        neighbor_options = [""] + [c["code"] for i,c in enumerate(candidates) if i != idx]
+        neighboring_naics = st.selectbox("Select a neighboring / alternative NAICS code", neighbor_options)
+    else:
+        st.warning("No six-digit NAICS code was found in the uploaded files.")
+        selected_naics = st.text_input("Enter the NAICS code manually")
+        neighboring_naics = st.text_input("Enter a neighboring NAICS code")
+    naics_reason = st.text_area("One sentence: Why is this the correct NAICS code?", placeholder="Explain why the company's primary activity fits this code.")
+    neighbor_reason = st.text_area("One sentence: Why not the neighboring code?", placeholder="Explain the key activity that makes the neighboring code less appropriate.")
 
-    labels = {
-        "naics": "NAICS Classification",
-        "industry_size": "Industry Size & Five-Year Growth",
-        "competitors": "Top Competitors & Market Share",
-        "regulation": "Regulatory / Compliance Pressure",
-        "supply_chain": "Supply Chain Concentration / Fragility",
-        "customers": "Customer Concentration / Fragmentation",
-        "trend": "Biggest Five-Year Trend",
-        "threat": "Biggest Threat"
-    }
+    for key in ["industry_size","growth","competitors","regulation","supply_chain","customers","trend","threat"]:
+        item = brief["signals"][key]
+        with st.expander(item["label"], expanded=True):
+            st.markdown("**Extracted answer**"); st.write(item["summary"])
+            if item["evidence"]:
+                st.markdown("**Traceable evidence**")
+                for e in item["evidence"]:
+                    st.markdown(f'> {e["sentence"]}\n\n**Source:** {e["document"]}, {e["location"]}')
+            else:
+                st.warning("Not found in the uploaded files.")
 
-    for key in ["naics", "industry_size", "competitors", "regulation", "supply_chain", "customers", "trend", "threat"]:
-        item = brief[key]
-        with st.expander(labels[key], expanded=(key in ["naics", "industry_size"])):
-            st.write(item["summary"])
+    st.subheader("What the Pipeline Could Not Find")
+    if brief["missing"]:
+        for m in brief["missing"]: st.write(f'• **{m["signal"]}** — {m["needed"]}')
+    else:
+        st.write("All required categories had at least some supporting evidence.")
 
-            if item["pdf"]:
-                st.markdown("**Uploaded report evidence**")
-                for p in item["pdf"]:
-                    st.markdown(f'**{p["document"]}, p. {p["page"]}**')
-                    st.write(p["excerpt"])
-
-            if item["web"]:
-                st.markdown("**Public web source leads**")
-                df = pd.DataFrame(item["web"])[["title", "snippet", "url"]]
-                st.dataframe(
-                    df,
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={"url": st.column_config.LinkColumn("Source URL")}
-                )
-
-    st.divider()
-    st.subheader("Export")
-    md = make_markdown(company, brief)
-
-    st.download_button(
-        "⬇️ Download structured brief (Markdown)",
-        data=md,
-        file_name=f"{re.sub(r'[^A-Za-z0-9_-]+','_',company)}_industry_brief.md",
-        mime="text/markdown",
-        use_container_width=True
-    )
+    st.divider(); st.header("4. Export")
+    md = render_markdown(brief, selected_naics, neighboring_naics, naics_reason, neighbor_reason)
+    stem = re.sub(r'[^A-Za-z0-9_-]+','_',brief['company'])
+    st.download_button("⬇️ Download Markdown Brief", md, file_name=f"{stem}_industry_brief.md", mime="text/markdown", use_container_width=True)
+    st.download_button("⬇️ Download PDF Brief", markdown_to_pdf(md), file_name=f"{stem}_industry_brief.pdf", mime="application/pdf", use_container_width=True)
 
     rows = []
-    for category, item in brief.items():
-        for p in item["pdf"]:
-            rows.append({
-                "category": labels.get(category, category),
-                "source_type": "Uploaded PDF",
-                "source": p["document"],
-                "page": p["page"],
-                "evidence": p["excerpt"],
-                "url": ""
-            })
-        for w in item["web"]:
-            rows.append({
-                "category": labels.get(category, category),
-                "source_type": "Web",
-                "source": w.get("title",""),
-                "page": "",
-                "evidence": w.get("snippet",""),
-                "url": w.get("url","")
-            })
+    for _,item in brief["signals"].items():
+        for e in item["evidence"]:
+            rows.append({"Signal":item["label"],"Extracted Evidence":e["sentence"],"Document":e["document"],"Location":e["location"]})
+    if rows:
+        df = pd.DataFrame(rows)
+        st.download_button("⬇️ Download Source Log (CSV)", df.to_csv(index=False).encode("utf-8"), file_name=f"{stem}_source_log.csv", mime="text/csv", use_container_width=True)
 
-    csv = pd.DataFrame(rows).to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "⬇️ Download source log (CSV)",
-        data=csv,
-        file_name=f"{re.sub(r'[^A-Za-z0-9_-]+','_',company)}_source_log.csv",
-        mime="text/csv",
-        use_container_width=True
-    )
-
-    st.caption(
-        "For your assignment, verify the final NAICS code against the Census manual and verify every number against its original source."
-    )
+    st.subheader("Final submission check")
+    st.markdown('''
+- Open the website in a private/incognito window to confirm the link works without login.
+- Verify the selected NAICS code using the official Census NAICS manual.
+- Check that each number is directly supported by the cited page/section.
+- Keep the missing-information section if the uploaded reports do not support a required signal.
+- Put the public website link at the top of page one of your assignment PDF.
+''')
