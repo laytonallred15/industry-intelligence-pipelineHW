@@ -12,20 +12,7 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 
 st.set_page_config(page_title="Industry Intelligence Pipeline", page_icon="📊", layout="wide")
 st.title("📊 Industry Intelligence Pipeline")
-st.caption("Turn a company name and uploaded industry reports into a structured, source-traceable industry brief.")
-
-col1, col2, col3 = st.columns(3)
-with col1:
-    st.markdown("### 🧭 NAICS")
-    st.caption("Automatically finds and verifies the best-fit NAICS code using the U.S. Census manual.")
-with col2:
-    st.markdown("### 📚 Evidence")
-    st.caption("Searches uploaded reports for the strongest evidence for every required industry signal.")
-with col3:
-    st.markdown("### 📝 Brief")
-    st.caption("Returns sourced findings plus a paragraph summary at the end of every section.")
-
-st.divider()
+st.caption("Built for the assignment: company → NAICS → three industry reports → sourced industry brief")
 
 CENSUS_MANUAL_URL = "https://www.census.gov/naics/reference_files_tools/2022_NAICS_Manual.pdf"
 
@@ -111,7 +98,7 @@ def sentence_candidates(pages, keywords, reject=None, max_items=3):
     return out
 
 # ============================================================
-# AUTOMATIC NAICS
+# AUTOMATIC NAICS — SAME APPROACH AS BEFORE
 # ============================================================
 
 def web_search(query, max_results=6):
@@ -120,229 +107,97 @@ def web_search(query, max_results=6):
         with DDGS() as ddgs:
             for r in ddgs.text(query, max_results=max_results):
                 rows.append({
-                    "title": clean(r.get("title", "")),
-                    "url": r.get("href", ""),
-                    "snippet": clean(r.get("body", ""))
+                    "title": clean(r.get("title","")),
+                    "url": r.get("href",""),
+                    "snippet": clean(r.get("body",""))
                 })
     except Exception:
         pass
     return rows
 
-
-def discover_company_profile(company):
-    """
-    Build a short description of the company's actual business from public web results.
-    """
-    results = []
-    for q in [
-        f'"{company}" products company overview',
-        f'"{company}" annual report business products',
-        f'"{company}" primary business manufactures sells'
-    ]:
-        results.extend(web_search(q, max_results=5))
-
-    snippets = []
-    seen = set()
-    for r in results:
-        s = clean(r.get("snippet", ""))
-        if s and s.lower() not in seen:
-            seen.add(s.lower())
-            snippets.append(s)
-
-    return " ".join(snippets[:6]), results[:10]
-
-
-def find_candidate_naics_codes(company):
-    """
-    Discover likely six-digit NAICS codes from public search results.
-    These are candidates only; final verification comes from Census.
-    """
-    queries = [
-        f'"{company}" NAICS code',
-        f'"{company}" "NAICS"',
-        f'"{company}" industry classification NAICS',
-        f'"{company}" primary business products'
-    ]
-
-    evidence = []
-    candidate_counts = {}
-
-    for q in queries:
-        for r in web_search(q, max_results=8):
-            text = f'{r["title"]} {r["snippet"]}'
-            codes = re.findall(r'(?<!\d)(\d{6})(?!\d)', text)
-
-            for code in codes:
-                candidate_counts[code] = candidate_counts.get(code, 0) + 1
-
-            evidence.append({
-                **r,
-                "query": q,
-                "codes": codes
-            })
-
-    ranked = sorted(candidate_counts.items(), key=lambda x:x[1], reverse=True)
-    return [code for code,_ in ranked[:12]], evidence
-
-
 @st.cache_resource(show_spinner=False)
 def load_census_manual():
-    """
-    Download the official Census 2022 NAICS Manual once per Streamlit session.
-    """
-    response = requests.get(
-        CENSUS_MANUAL_URL,
-        timeout=60,
-        headers={"User-Agent":"Mozilla/5.0"}
-    )
-    response.raise_for_status()
-
+    r = requests.get(CENSUS_MANUAL_URL, timeout=60)
+    r.raise_for_status()
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-        tmp.write(response.content)
+        tmp.write(r.content)
         path = tmp.name
-
     reader = PdfReader(path)
-    pages = []
-
-    for i, page in enumerate(reader.pages, start=1):
-        txt = clean(page.extract_text() or "")
-        pages.append({
-            "page": i,
-            "text": txt
-        })
-
+    pages = [{"page": i, "text": clean(p.extract_text() or "")}
+             for i,p in enumerate(reader.pages, start=1)]
     try:
         os.remove(path)
-    except Exception:
+    except:
         pass
-
     return pages
 
+def discover_company_profile(company):
+    snippets = []
+    for q in [
+        f'"{company}" products company overview',
+        f'"{company}" annual report products',
+        f'"{company}" manufactures sells'
+    ]:
+        for r in web_search(q, 5):
+            if r["snippet"]:
+                snippets.append(r["snippet"])
+    return " ".join(snippets[:8])
 
-def census_verify_code(code, census_pages):
-    """
-    Locate a candidate code in the official Census NAICS Manual and return
-    the strongest official description window.
-    """
-    exact = re.compile(rf'(?<!\d){re.escape(code)}(?!\d)')
-    matches = []
+def candidate_naics_codes(company):
+    counts = {}
+    for q in [
+        f'"{company}" NAICS code',
+        f'"{company}" "NAICS"',
+        f'"{company}" industry classification NAICS'
+    ]:
+        for r in web_search(q, 8):
+            for c in re.findall(r'(?<!\d)(\d{6})(?!\d)', r["title"]+" "+r["snippet"]):
+                counts[c] = counts.get(c,0)+1
+    return [c for c,_ in sorted(counts.items(), key=lambda x:x[1], reverse=True)[:12]]
 
-    for p in census_pages:
-        m = exact.search(p["text"])
+def verify_naics(code, census_pages):
+    patt = re.compile(rf'(?<!\d){re.escape(code)}(?!\d)')
+    options = []
+    for row in census_pages:
+        m = patt.search(row["text"])
         if not m:
             continue
-
-        start = max(0, m.start() - 160)
-        end = min(len(p["text"]), m.end() + 1100)
-        window = clean(p["text"][start:end])
+        start = max(0, m.start()-120)
+        end = min(len(row["text"]), m.end()+1050)
+        window = clean(row["text"][start:end])
         low = window.lower()
-
         score = 0
         if "this industry comprises establishments primarily engaged" in low:
-            score += 12
+            score += 15
         if "see industry description for" in low:
-            score += 4
+            score += 3
         if "cross-references" in low:
+            score += 2
+        if row["page"] < 650:
             score += 3
-        if p["page"] < 650:
-            score += 3
-
-        matches.append({
-            "code": code,
-            "page": p["page"],
-            "text": window,
-            "score": score,
-            "source_url": CENSUS_MANUAL_URL
-        })
-
-    if not matches:
-        return None
-
-    matches.sort(key=lambda x:x["score"], reverse=True)
-    return matches[0]
-
-
-def term_overlap_score(profile, census_text):
-    """
-    Lightweight ranking of company business profile vs official Census text.
-    """
-    stop = {
-        "company","companies","business","products","product","market","industry",
-        "sales","sells","selling","design","designs","designed","including",
-        "offers","provides","and","the","for","with","from","into","that","this",
-        "are","its","their","has","have","was","were","www","com"
-    }
-
-    profile_terms = set(
-        w for w in re.findall(r"[a-z]{3,}", profile.lower())
-        if w not in stop
-    )
-    census_terms = set(re.findall(r"[a-z]{3,}", census_text.lower()))
-
-    overlap = profile_terms & census_terms
-    score = len(overlap)
-
-    # Domain-specific boosts only when naturally present in both.
-    for phrase in [
-        "golf", "golf balls", "golf clubs", "sporting", "athletic",
-        "apparel", "footwear", "retail", "wholesale", "manufacturing"
-    ]:
-        if phrase in profile.lower() and phrase in census_text.lower():
-            score += 6
-
-    return score, sorted(overlap)
-
-
-def automatic_naics_lookup(company):
-    """
-    Earlier working workflow:
-    company -> public candidate codes -> official Census manual verification -> ranked results.
-    """
-    profile, profile_sources = discover_company_profile(company)
-    candidate_codes, discovery_sources = find_candidate_naics_codes(company)
-
-    if not candidate_codes:
-        return {
-            "profile": profile,
-            "profile_sources": profile_sources,
-            "ranked": [],
-            "discovery_sources": discovery_sources,
-            "error": "No six-digit NAICS candidates were discovered from public search results."
-        }
-
-    census_pages = load_census_manual()
-    verified = []
-
-    for code in candidate_codes:
-        official = census_verify_code(code, census_pages)
-        if not official:
-            continue
-
-        overlap_score, overlap_terms = term_overlap_score(profile, official["text"])
-        appearances = sum(1 for r in discovery_sources if code in r.get("codes", []))
-
-        official["rank_score"] = overlap_score + appearances * 4
-        official["overlap_terms"] = overlap_terms
-        official["appearances"] = appearances
-        verified.append(official)
-
-    verified.sort(key=lambda x:x["rank_score"], reverse=True)
-
-    return {
-        "profile": profile,
-        "profile_sources": profile_sources,
-        "ranked": verified,
-        "discovery_sources": discovery_sources,
-        "error": None
-    }
-
+        options.append({"code":code, "page":row["page"], "text":window, "score":score})
+    return max(options, key=lambda x:x["score"]) if options else None
 
 def rank_naics(company):
-    """
-    Compatibility wrapper for the rest of the app.
-    """
-    result = automatic_naics_lookup(company)
-    return result.get("profile",""), result.get("ranked",[])
+    profile = discover_company_profile(company)
+    codes = candidate_naics_codes(company)
+    census = load_census_manual()
+    pwords = set(re.findall(r"[a-z]{3,}", profile.lower()))
+    ranked = []
+    for code in codes:
+        item = verify_naics(code, census)
+        if not item:
+            continue
+        cwords = set(re.findall(r"[a-z]{3,}", item["text"].lower()))
+        score = item["score"] + len(pwords & cwords)
+        for phrase in ["golf","sporting","athletic","golf ball","golf club","apparel","footwear"]:
+            if phrase in profile.lower() and phrase in item["text"].lower():
+                score += 8
+        item["rank_score"] = score
+        ranked.append(item)
+    ranked.sort(key=lambda x:x["rank_score"], reverse=True)
+    return profile, ranked[:6]
+
 # ============================================================
 # IDENTIFY THE THREE REPORT TYPES
 # ============================================================
@@ -472,18 +327,18 @@ def extract_competitors(name, pages, target_company):
                     "source":page_source(name,row["page"])
                 })
 
-    # Keep the focal company in the results when its share is reported.
-    priority = {
-        "Callaway Golf": 0,
-        "Acushnet Holdings Corp.": 1,
-        "Titleist": 2,
-        "TaylorMade Golf": 3,
-        "Wilson Sporting Goods": 4,
-        "Coleman": 5,
-        "Sport Dimension": 6
-    }
-    rows.sort(key=lambda x: priority.get(x["company"], 99))
-    return rows[:5]
+    # Exclude the target company itself.
+    target_tokens = target_company.lower()
+    filtered = []
+    for r in rows:
+        if "callaway" in target_tokens and "callaway" in r["company"].lower():
+            continue
+        filtered.append(r)
+
+    # Prioritize golf-relevant names.
+    priority = {"Acushnet Holdings Corp.":1, "Titleist":2, "TaylorMade Golf":3, "Wilson Sporting Goods":4, "Coleman":5}
+    filtered.sort(key=lambda x: priority.get(x["company"],99))
+    return filtered[:5]
 
 def extract_regulation(name, pages):
     hits = sentence_candidates(
@@ -599,91 +454,6 @@ def extract_threat(ibis_name, ibis_pages, barnes_name, barnes_pages):
     )
     return {"threat":title, "interpretation":interpretation, "evidence":evidence[:4]}
 
-
-def make_section_summaries(company, brief):
-    s = brief["size"]
-    g = brief["golf_growth"]
-    k = brief["retail_context"]
-    comps = brief["competitors"]
-    reg = brief["regulation"]
-    supply = brief["supply_chain"]
-    customers = brief["customers"]
-    trend = brief["trend"]
-    threat = brief["threat"]
-
-    summaries = {}
-
-    summaries["naics"] = (
-        "The selected NAICS code is the best match for the company's primary business activity based on the official U.S. Census definition. "
-        "The alternative code is included to document why the selected code is the stronger fit."
-    )
-
-    size_bits = []
-    if s["industry_size"] != "Not found":
-        size_bits.append(f"the NAICS-aligned U.S. industry is about {s['industry_size']} in {s['industry_size_year']}")
-    if g["market_size_2026"] != "Not found":
-        size_bits.append(f"the golf-specific global market is about {g['market_size_2026']} in 2026")
-    if k["global_sales_2025"] != "Not found":
-        size_bits.append(f"the retail-market cross-check is {k['global_sales_2025']} in 2025")
-
-    summaries["size_growth"] = (
-        "Overall, " + "; ".join(size_bits) + ". "
-        f"The strongest five-year golf-market forecast is {g['five_year_cagr']} CAGR for {g['period']}, "
-        f"while the broader U.S. industry is forecast at {s['forecast_cagr']} for {s['forecast_period']}. "
-        "Together, the sources suggest modest growth in the broad manufacturing industry and stronger growth in the golf-specific market."
-        if size_bits else
-        "The uploaded reports did not provide enough clean market-size and five-year-growth evidence to summarize this section."
-    )
-
-    if comps:
-        comp_text = ", ".join(f"{x['company']} ({x['market_share']})" for x in comps)
-        summaries["competitors"] = (
-            f"The strongest company-level market-share evidence identifies {comp_text}. "
-            f"{company} is included when its share is reported. Exact percentages and ranges are preserved as reported rather than converted into invented estimates."
-        )
-    else:
-        summaries["competitors"] = (
-            "The uploaded reports did not provide reliable named company market-share estimates."
-        )
-
-    summaries["regulation"] = (
-        "The main regulatory pressures relate to product safety, environmental standards, and manufacturing compliance. "
-        "These requirements can raise operating costs and create recall, legal, or compliance risk."
-        if reg else
-        "The uploaded reports did not provide enough direct regulatory evidence for a supported conclusion."
-    )
-
-    summaries["supply_chain"] = (
-        "The industry has meaningful supply-chain exposure to imports, tariffs, overseas production, and raw-material or supplier volatility. "
-        "These factors can increase costs and make manufacturers more sensitive to trade-policy changes and disruptions."
-        if supply else
-        "The uploaded reports did not provide enough direct supply-chain evidence for a supported conclusion."
-    )
-
-    summaries["customers"] = (
-        f"The customer structure is best described as {customers['assessment'].lower()}, with buyer power reported as {customers['buyer_power'].lower()}. "
-        "The evidence points to multiple end-user and retail channels rather than dependence on one dominant customer group."
-        if customers["assessment"] != "Not found"
-        else
-        "The uploaded reports did not provide enough evidence to classify customer concentration."
-    )
-
-    summaries["trend"] = (
-        f"The clearest next-five-year trend is {trend['trend'].lower()}. {trend['interpretation']}"
-        if trend["trend"] != "Not found"
-        else
-        "The uploaded reports did not provide enough forward-looking evidence to identify a defensible trend."
-    )
-
-    summaries["threat"] = (
-        f"The biggest threat identified is {threat['threat'].lower()}. {threat['interpretation']}"
-        if threat["threat"] != "Not found"
-        else
-        "The uploaded reports did not provide enough risk evidence to identify a defensible biggest threat."
-    )
-
-    return summaries
-
 def build_brief(company, reports):
     ibis = reports.get("ibis")
     barnes = reports.get("barnes")
@@ -696,7 +466,7 @@ def build_brief(company, reports):
     barnes_name, barnes_pages = barnes
     kentley_name, kentley_pages = kentley
 
-    brief = {
+    return {
         "size": extract_ibis_size_growth(ibis_name, ibis_pages),
         "golf_growth": extract_barnes_growth(barnes_name, barnes_pages),
         "retail_context": extract_kentley_context(kentley_name, kentley_pages),
@@ -708,8 +478,6 @@ def build_brief(company, reports):
         "trend": extract_trend(ibis_name, ibis_pages, barnes_name, barnes_pages),
         "threat": extract_threat(ibis_name, ibis_pages, barnes_name, barnes_pages),
     }
-    brief["summaries"] = make_section_summaries(company, brief)
-    return brief
 
 # ============================================================
 # EXPORT
@@ -734,7 +502,7 @@ def brief_markdown(company, chosen, alt, b):
             f"**Alternative evidence:** {alt['text']}",
             f"**Source:** 2022 U.S. Census NAICS Manual, PDF p. {alt['page']}"
         ]
-    lines += ["", f"**Summary:** {b['summaries']['naics']}", ""]
+    lines.append("")
 
     lines += [
         "## Industry Size and Five-Year Growth Trajectory",
@@ -750,8 +518,6 @@ def brief_markdown(company, chosen, alt, b):
         "",
         f"**Golf-equipment retail cross-check:** {k['global_sales_2025']} in 2025 → {k['global_sales_2029']} in 2029; calculated CAGR {k['calculated_cagr']}.",
         f"**Source:** {k['source']}",
-        "",
-        f"**Summary:** {b['summaries']['size_growth']}",
         ""
     ]
 
@@ -762,20 +528,18 @@ def brief_markdown(company, chosen, alt, b):
         "",
         "**Important limitation:** The IBISWorld PDF reports exact shares for some companies and ranges for others. "
         "Range estimates are shown as reported rather than converted into invented point estimates.",
-        "",
-        f"**Summary:** {b['summaries']['competitors']}",
         ""
     ]
 
     lines += ["## Regulatory / Compliance Pressure"]
     for x in b["regulation"]:
         lines.append(f"- {x['text']} — Source: {x['source']}")
-    lines += ["", f"**Summary:** {b['summaries']['regulation']}", ""]
+    lines.append("")
 
     lines += ["## Supply-Chain Concentration or Fragility"]
     for x in b["supply_chain"]:
         lines.append(f"- {x['text']} — Source: {x['source']}")
-    lines += ["", f"**Summary:** {b['summaries']['supply_chain']}", ""]
+    lines.append("")
 
     c=b["customers"]
     lines += [
@@ -788,8 +552,6 @@ def brief_markdown(company, chosen, alt, b):
         lines.append(f"- {x['text']} — Source: {x['source']}")
     lines += [
         f"- Golf-specific end-user evidence: {b['end_users']['text']} — Source: {b['end_users']['source']}",
-        "",
-        f"**Summary:** {b['summaries']['customers']}",
         ""
     ]
 
@@ -801,7 +563,7 @@ def brief_markdown(company, chosen, alt, b):
     ]
     for x in t["evidence"]:
         lines.append(f"- {x['text']} — Source: {x['source']}")
-    lines += ["", f"**Summary:** {b['summaries']['trend']}", ""]
+    lines.append("")
 
     th=b["threat"]
     lines += [
@@ -811,7 +573,7 @@ def brief_markdown(company, chosen, alt, b):
     ]
     for x in th["evidence"]:
         lines.append(f"- {x['text']} — Source: {x['source']}")
-    lines += ["", f"**Summary:** {b['summaries']['threat']}", ""]
+    lines.append("")
 
     missing=[]
     if len(b["competitors"])<3:
@@ -864,21 +626,20 @@ def markdown_pdf(md):
 # UI
 # ============================================================
 
-st.subheader("Company Name")
-company = st.text_input(
-    "Company name",
-    value="Callaway Golf Company",
-    label_visibility="collapsed"
-)
+st.subheader("1. Company")
+company = st.text_input("Company name", value="Callaway Golf Company")
 
-st.subheader("Upload Reports")
+st.subheader("2. Upload the three reports")
 uploads = st.file_uploader(
-    "Upload industry reports",
+    "Upload the IBISWorld, Barnes Reports, and Kentley Insights PDFs",
     type=["pdf"],
-    accept_multiple_files=True,
-    label_visibility="collapsed"
+    accept_multiple_files=True
 )
-st.caption("Upload any relevant industry reports. The tool will use the reports to build the sourced industry brief.")
+st.caption(
+    "Designed for: (1) IBISWorld Athletic & Sporting Goods Manufacturing in the US, "
+    "(2) Barnes 2026 Golf Equipment and Apparel Outlook, and "
+    "(3) Kentley Insights Golf Equipment Retail Sales."
+)
 
 run = st.button("🚀 Build Industry Brief", type="primary", use_container_width=True, disabled=(not company or len(uploads)<3))
 
@@ -940,7 +701,6 @@ if "brief" in st.session_state:
                 st.write(alt["text"])
     else:
         st.warning("No Census-verified NAICS candidate was returned.")
-    st.info("**Section Summary:** " + b["summaries"]["naics"])
 
     # Size / growth
     st.subheader("Industry Size and Five-Year Growth Trajectory")
@@ -964,7 +724,6 @@ if "brief" in st.session_state:
         f"(calculated CAGR {k['calculated_cagr']})."
     )
     st.caption(k["source"])
-    st.info("**Section Summary:** " + b["summaries"]["size_growth"])
 
     # Competitors
     st.subheader("Top Competitors and Market Share Estimates")
@@ -976,19 +735,16 @@ if "brief" in st.session_state:
         st.caption("Exact percentages and ranges are preserved exactly as IBISWorld reports them; the tool does not invent point estimates.")
     else:
         st.warning("No named competitor share estimates found.")
-    st.info("**Section Summary:** " + b["summaries"]["competitors"])
 
     # Regulation
     st.subheader("Regulatory / Compliance Pressure")
     for x in b["regulation"]:
         st.write("• "+x["text"]); st.caption(x["source"])
-    st.info("**Section Summary:** " + b["summaries"]["regulation"])
 
     # Supply
     st.subheader("Supply-Chain Concentration or Fragility")
     for x in b["supply_chain"]:
         st.write("• "+x["text"]); st.caption(x["source"])
-    st.info("**Section Summary:** " + b["summaries"]["supply_chain"])
 
     # Customer
     st.subheader("Customer Concentration or Fragmentation")
@@ -1001,7 +757,6 @@ if "brief" in st.session_state:
     st.markdown("**Golf-specific end users:**")
     st.write(b["end_users"]["text"])
     st.caption(b["end_users"]["source"])
-    st.info("**Section Summary:** " + b["summaries"]["customers"])
 
     # Trend
     st.subheader("Biggest Trend of the Next Five Years")
@@ -1010,7 +765,6 @@ if "brief" in st.session_state:
     st.write(t["interpretation"])
     for x in t["evidence"]:
         st.write("• "+x["text"]); st.caption(x["source"])
-    st.info("**Section Summary:** " + b["summaries"]["trend"])
 
     # Threat
     st.subheader("Biggest Threat")
@@ -1019,7 +773,6 @@ if "brief" in st.session_state:
     st.write(th["interpretation"])
     for x in th["evidence"]:
         st.write("• "+x["text"]); st.caption(x["source"])
-    st.info("**Section Summary:** " + b["summaries"]["threat"])
 
     # Missing
     st.subheader("What the Pipeline Could Not Find")
